@@ -30,9 +30,11 @@ type Message struct {
 }
 
 type ChatServer struct {
-	mu       sync.RWMutex
-	messages []Message
-	clients  map[*Client]struct{}
+	mu        sync.RWMutex
+	messages  []Message
+	clients   map[*Client]struct{}
+	ipCounts  map[string]int  // Track connections per IP
+	nicknames map[string]bool // Track used nicknames
 }
 
 var (
@@ -67,7 +69,9 @@ var banManager = NewBanManager()
 
 func NewChatServer() *ChatServer {
 	cs := &ChatServer{
-		clients: make(map[*Client]struct{}),
+		clients:   make(map[*Client]struct{}),
+		ipCounts:  make(map[string]int),
+		nicknames: make(map[string]bool),
 	}
 	welcome := Message{
 		Time:  time.Now(),
@@ -83,12 +87,19 @@ func NewChatServer() *ChatServer {
 func (cs *ChatServer) AddClient(c *Client) {
 	cs.mu.Lock()
 	cs.clients[c] = struct{}{}
+	cs.ipCounts[c.ip]++
+	cs.nicknames[c.nickname] = true
 	cs.mu.Unlock()
 }
 
 func (cs *ChatServer) RemoveClient(c *Client) {
 	cs.mu.Lock()
 	delete(cs.clients, c)
+	cs.ipCounts[c.ip]--
+	if cs.ipCounts[c.ip] <= 0 {
+		delete(cs.ipCounts, c.ip)
+	}
+	delete(cs.nicknames, c.nickname)
 	cs.mu.Unlock()
 }
 
@@ -158,6 +169,37 @@ func (cs *ChatServer) ClientCount() int {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	return len(cs.clients)
+}
+
+// CheckIPLimit returns true if the IP has not exceeded the connection limit (2)
+func (cs *ChatServer) CheckIPLimit(ip string) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.ipCounts[ip] < 2
+}
+
+// GetUniqueNickname returns a unique nickname by adding 8-character HEX suffix if needed
+func (cs *ChatServer) GetUniqueNickname(baseNickname string) string {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	// If nickname is not taken, return as-is
+	if !cs.nicknames[baseNickname] {
+		return baseNickname
+	}
+
+	// Generate unique nickname with 8-character HEX suffix
+	for i := 0; i < 100; i++ { // Try up to 100 times to avoid infinite loop
+		suffix := fmt.Sprintf("%08x", rand.Int31())
+		uniqueNickname := fmt.Sprintf("%s-%s", baseNickname, suffix)
+		if !cs.nicknames[uniqueNickname] {
+			return uniqueNickname
+		}
+	}
+
+	// Fallback: use timestamp as suffix
+	suffix := fmt.Sprintf("%08x", time.Now().Unix())
+	return fmt.Sprintf("%s-%s", baseNickname, suffix)
 }
 
 func (cs *ChatServer) logMessage(msg Message) {
@@ -731,6 +773,13 @@ func main() {
 			return
 		}
 
+		// Check IP connection limit (max 2 per IP)
+		if !globalChat.CheckIPLimit(ip) {
+			fmt.Fprintln(s, "Connection limit exceeded for this IP (max 2 connections).")
+			_ = s.Exit(1)
+			return
+		}
+
 		nickname := strings.TrimSpace(s.User())
 		if nickname == "" {
 			nickname = generateGuestNickname()
@@ -739,16 +788,19 @@ func main() {
 			nickname = string([]rune(nickname)[:10])
 		}
 
-		client := NewClient(globalChat, s, nickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), ip)
+		// Handle nickname collision by adding 8-character HEX suffix if needed
+		finalNickname := globalChat.GetUniqueNickname(nickname)
+
+		client := NewClient(globalChat, s, finalNickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), ip)
 		globalChat.AddClient(client)
 		defer func() {
 			globalChat.RemoveClient(client)
 			client.Close()
-			globalChat.AppendSystemMessage(fmt.Sprintf("%s left the chat", nickname))
+			globalChat.AppendSystemMessage(fmt.Sprintf("%s left the chat", finalNickname))
 		}()
 
 		fmt.Fprint(s, "\x1b[2J\x1b[H")
-		globalChat.AppendSystemMessage(fmt.Sprintf("%s joined the chat", nickname))
+		globalChat.AppendSystemMessage(fmt.Sprintf("%s joined the chat", finalNickname))
 
 		go client.MonitorWindow(winCh)
 		client.Start(reader, s.Context())
