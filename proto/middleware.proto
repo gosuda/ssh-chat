@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package sshchat;
+
+option go_package = "github.com/iwanhae/ssh-chat/proto;proto";
+
+// StreamMiddleware defines bidirectional streaming for SSH chat and AI messages
+service StreamMiddleware {
+  // StreamChat establishes a bidirectional stream:
+  // - Server sends ChatMessage when SSH clients send messages
+  // - Client sends AIResponse with streaming text chunks
+  rpc StreamChat(stream AIResponse) returns (stream ChatMessage) {}
+}
+
+// ChatMessage represents a message from an SSH client
+message ChatMessage {
+  string message_id = 1;  // Unique message ID for tracking
+  string nick = 2;        // Nickname of the sender
+  string text = 3;        // Message text
+  int64 timestamp = 4;    // Unix timestamp in seconds
+  string ip = 5;          // IP address of the sender
+}
+
+// AIResponse represents AI's response chunk(s)
+message AIResponse {
+  string message_id = 1;  // References the ChatMessage ID being responded to
+  string text = 2;        // Text chunk (can be partial for streaming)
+  bool is_final = 3;      // True if this is the last chunk for this message_id
+  bytes auth_signature = 4;  // ECDSA signature for client authentication (sent only in first message)
+  int64 auth_timestamp = 5;  // Unix timestamp in milliseconds (signed with signature)
+  string nick = 6;        // Nickname for the AI sender
+  string ip = 7;          // IPv4 address of the client (signed with signature)
+}
