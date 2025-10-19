@@ -3,9 +3,18 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/asn1"
+	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math/big"
 	"math/rand"
 	"net"
 	"os"
@@ -18,15 +27,22 @@ import (
 	"unicode"
 
 	"github.com/gliderlabs/ssh"
+	pb "github.com/iwanhae/ssh-chat/proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/peer"
 )
 
 type Message struct {
+	ID       string // Unique message ID for tracking streaming updates
 	Time     time.Time
 	Nick     string
 	Text     string
 	Color    int
 	IP       string
 	Mentions []string // List of mentioned usernames
+	IsUpdate bool     // True if this is an update to an existing message
 }
 
 type ChatServer struct {
@@ -40,6 +56,7 @@ type ChatServer struct {
 var (
 	globalChat   = NewChatServer()
 	guestCounter uint64
+	grpcService  *gRPCServer
 )
 
 // BanManager keeps a set of banned IP addresses.
@@ -104,6 +121,11 @@ func (cs *ChatServer) RemoveClient(c *Client) {
 }
 
 func (cs *ChatServer) AppendMessage(msg Message) {
+	// Generate ID if not set
+	if msg.ID == "" {
+		msg.ID = fmt.Sprintf("%d-%s", time.Now().UnixNano(), msg.Nick)
+	}
+
 	// Detect mentions in the message
 	msg.Mentions = extractMentions(msg.Text)
 
@@ -128,6 +150,53 @@ func (cs *ChatServer) AppendMessage(msg Message) {
 		}
 		client.NotifyWithBell(isMentioned)
 	}
+}
+
+func (cs *ChatServer) AppendMessageWithID(msg Message) string {
+	// Generate ID if not set
+	if msg.ID == "" {
+		msg.ID = fmt.Sprintf("%d-%s", time.Now().UnixNano(), msg.Nick)
+	}
+	cs.AppendMessage(msg)
+	return msg.ID
+}
+
+// UpdateMessage updates an existing message (for streaming AI responses)
+func (cs *ChatServer) UpdateMessage(id string, text string) bool {
+	trimmed := strings.TrimLeftFunc(text, unicode.IsSpace)
+	trimmed = strings.ReplaceAll(trimmed, "\r", "")
+	trimmed = strings.ReplaceAll(trimmed, "\n", " ")
+
+	cs.mu.Lock()
+
+	var (
+		clients []*Client
+		updated bool
+	)
+
+	for i := len(cs.messages) - 1; i >= 0; i-- {
+		if cs.messages[i].ID == id {
+			cs.messages[i].Text = trimmed
+			cs.messages[i].IsUpdate = true
+
+			clients = make([]*Client, 0, len(cs.clients))
+			for c := range cs.clients {
+				clients = append(clients, c)
+			}
+			updated = true
+			break
+		}
+	}
+
+	cs.mu.Unlock()
+
+	if updated {
+		for _, client := range clients {
+			client.NotifyWithBell(false)
+		}
+	}
+
+	return updated
 }
 
 func (cs *ChatServer) AppendSystemMessage(text string) {
@@ -219,6 +288,7 @@ type Client struct {
 	server  *ChatServer
 
 	mu                sync.Mutex
+	writeMu           sync.Mutex // Protects writes to session
 	width             int
 	height            int
 	scrollOffset      int
@@ -291,9 +361,16 @@ func (c *Client) Close() {
 }
 
 func (c *Client) Notify() {
-	select {
-	case c.updateCh <- struct{}{}:
-	default:
+	for {
+		select {
+		case c.updateCh <- struct{}{}:
+			return
+		default:
+			select {
+			case <-c.updateCh:
+			default:
+			}
+		}
 	}
 }
 
@@ -301,7 +378,9 @@ func (c *Client) Notify() {
 func (c *Client) NotifyWithBell(withBell bool) {
 	if withBell {
 		// Send bell character before the update notification
+		c.writeMu.Lock()
 		c.session.Write([]byte("\a"))
+		c.writeMu.Unlock()
 	}
 	c.Notify()
 }
@@ -439,6 +518,8 @@ func (c *Client) render() {
 	b.WriteString("\x1b[K")
 	b.WriteString("\x1b[?25h")
 
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if _, err := c.session.Write([]byte(b.String())); err != nil {
 		c.Close()
 	}
@@ -534,37 +615,20 @@ func (c *Client) handleEnter() {
 		return
 	}
 
-	c.server.AppendMessage(Message{
+	msg := Message{
 		Time:  time.Now(),
 		Nick:  c.nickname,
 		Text:  text,
 		Color: c.color,
 		IP:    c.ip,
-	})
+	}
+	c.server.AppendMessage(msg)
 
-	if strings.Contains(text, "스프링") {
-		c.server.AppendSystemMessage("물러가라 이 사악한 스프링놈아.")
-	}
-	if strings.Contains(text, "자바") {
-		c.server.AppendSystemMessage("망해라 자바")
-	}
-	if strings.Contains(text, "러스트") {
-		c.server.AppendSystemMessage("Go: Kubernetes, fzf, Tailscale, Typescript-go, ... / Rust: nil")
-	}
-	if strings.Contains(text, "파이썬") {
-		c.server.AppendSystemMessage("자기 스스로도 컴파일 못하는 허접한 언어.")
-	}
-	if strings.Contains(text, "고랭") {
-		c.server.AppendSystemMessage("돈 못벌쥬? 마이너쥬? ")
+	// Broadcast to gRPC service if available
+	if grpcService != nil {
+		grpcService.BroadcastMessage(msg)
 	}
 
-	if strings.Contains(text, "exit") {
-		c.server.AppendSystemMessage("exit 안되요. 그냥 ctrl + c 하시죠")
-	}
-
-	if strings.Contains(text, "help") {
-		c.server.AppendSystemMessage("help? 인생은 실전이에요.")
-	}
 }
 
 func (c *Client) handleBackspace() {
@@ -613,6 +677,12 @@ func (c *Client) handleEscape(reader *bufio.Reader) {
 	}
 }
 
+func (c *Client) ClearScreen() {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	fmt.Fprint(c.session, "\x1b[2J\x1b[H")
+}
+
 func isControlRune(r rune) bool {
 	return r < 32 || r == 127
 }
@@ -633,6 +703,13 @@ func formatMessage(msg Message, width int) []string {
 
 	var lines []string
 	segments := strings.Split(highlightedText, "\n")
+
+	wrapWidth := width
+	if msg.Nick == "AI" {
+		// AI 메시지는 줄바꿈을 하지 않고 터미널이 처리하도록 매우 큰 너비를 줍니다.
+		wrapWidth = 16384
+	}
+
 	for i, segment := range segments {
 		base := segment
 		if i == 0 {
@@ -640,7 +717,7 @@ func formatMessage(msg Message, width int) []string {
 		} else {
 			base = indent + segment
 		}
-		wrapped := wrapString(base, width)
+		wrapped := wrapString(base, wrapWidth)
 		lines = append(lines, wrapped...)
 	}
 	return lines
@@ -741,6 +818,27 @@ func tailString(s string, width int) string {
 	return string(runes[len(runes)-width:])
 }
 
+// sanitizeNickname removes escape sequences and non-printable runes to keep terminal output safe.
+func sanitizeNickname(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+
+	for _, r := range raw {
+		if r == '\x1b' || r == '\x9b' {
+			continue
+		}
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
 func generateGuestNickname() string {
 	id := atomic.AddUint64(&guestCounter, 1)
 	return fmt.Sprintf("guest-%d", id)
@@ -780,12 +878,16 @@ func main() {
 			return
 		}
 
-		nickname := strings.TrimSpace(s.User())
+		nickname := sanitizeNickname(strings.TrimSpace(s.User()))
 		if nickname == "" {
 			nickname = generateGuestNickname()
 		}
 		if len([]rune(nickname)) > 10 {
 			nickname = string([]rune(nickname)[:10])
+		}
+		nickname = sanitizeNickname(nickname)
+		if nickname == "" {
+			nickname = generateGuestNickname()
 		}
 
 		// Handle nickname collision by adding 8-character HEX suffix if needed
@@ -799,7 +901,7 @@ func main() {
 			globalChat.AppendSystemMessage(fmt.Sprintf("%s left the chat", finalNickname))
 		}()
 
-		fmt.Fprint(s, "\x1b[2J\x1b[H")
+		client.ClearScreen()
 		globalChat.AppendSystemMessage(fmt.Sprintf("%s joined the chat", finalNickname))
 
 		go client.MonitorWindow(winCh)
@@ -813,6 +915,31 @@ func main() {
 		Handler: h,
 	}
 	srv.SetOption(ssh.HostKeyFile("host.key"))
+
+	// Start gRPC server
+	grpcServer, grpcSvc, err := startGRPCServer(globalChat)
+	if err != nil {
+		log.Printf("Failed to start gRPC server: %v", err)
+		log.Println("Continuing without gRPC AI integration...")
+	} else {
+		grpcService = grpcSvc
+		grpcListener, err := net.Listen("tcp", ":3333")
+		if err != nil {
+			log.Fatalf("Failed to listen on port 3333: %v", err)
+		}
+
+		go func() {
+			log.Println("starting gRPC AI server on port 3333...")
+			if err := grpcServer.Serve(grpcListener); err != nil {
+				log.Printf("gRPC server error: %v", err)
+			}
+		}()
+
+		defer func() {
+			log.Println("Stopping gRPC server...")
+			grpcServer.GracefulStop()
+		}()
+	}
 
 	// 서버 실행은 고루틴에서; log.Fatal 쓰지 마세요
 	go func() {
@@ -943,4 +1070,295 @@ func ValidateNoCombining(input string) error {
 		}
 	}
 	return nil
+}
+
+// loadClientPublicKey loads the ECDSA public key from PEM file
+func loadClientPublicKey(filepath string) (*ecdsa.PublicKey, error) {
+	keyData, err := os.ReadFile(filepath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read public key file: %v", err)
+	}
+
+	block, _ := pem.Decode(keyData)
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block")
+	}
+
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse public key: %v", err)
+	}
+
+	ecdsaPub, ok := pub.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, errors.New("not an ECDSA public key")
+	}
+
+	return ecdsaPub, nil
+}
+
+// verifySignature verifies ECDSA signature over IP address + timestamp
+func verifySignature(pubKey *ecdsa.PublicKey, ipAddr string, timestamp int64, signature []byte) error {
+	// Create message to verify (IP bytes + 8 bytes timestamp in big endian)
+	// IP is in IPv4 format (e.g., "192.168.1.1")
+	ipBytes := []byte(ipAddr)
+	timestampBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(timestampBytes, uint64(timestamp))
+
+	// Concatenate IP + timestamp
+	message := append(ipBytes, timestampBytes...)
+
+	// Hash the message
+	hash := sha256.Sum256(message)
+
+	// Parse ASN.1 DER signature
+	var sig struct {
+		R, S *big.Int
+	}
+	if _, err := asn1.Unmarshal(signature, &sig); err != nil {
+		return fmt.Errorf("failed to unmarshal signature: %v", err)
+	}
+
+	// Verify signature
+	if !ecdsa.Verify(pubKey, hash[:], sig.R, sig.S) {
+		return errors.New("signature verification failed")
+	}
+
+	// Check timestamp is recent (within 1 minute)
+	now := time.Now().UnixMilli()
+	timeDiff := now - timestamp
+	if timeDiff < 0 {
+		timeDiff = -timeDiff
+	}
+	if timeDiff > 1*60*1000 { // 1 minute in milliseconds
+		return fmt.Errorf("timestamp too old or too far in future: %d ms", timeDiff)
+	}
+
+	return nil
+}
+
+// gRPCServer implements the StreamMiddleware service
+type gRPCServer struct {
+	pb.UnimplementedStreamMiddlewareServer
+	chatServer     *ChatServer
+	activeStreamMu sync.Mutex
+	activeStreams  map[string]chan *pb.ChatMessage
+	clientPubKey   *ecdsa.PublicKey // Client's public key for authentication
+}
+
+func newGRPCServer(cs *ChatServer) *gRPCServer {
+	// Load client's public key for authentication
+	pubKey, err := loadClientPublicKey("ai_grpc_client.pub")
+	if err != nil {
+		log.Fatalf("Failed to load client public key: %v", err)
+	}
+	log.Println("Loaded client public key for authentication")
+
+	return &gRPCServer{
+		chatServer:    cs,
+		activeStreams: make(map[string]chan *pb.ChatMessage),
+		clientPubKey:  pubKey,
+	}
+}
+
+// StreamChat implements bidirectional streaming
+func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) error {
+	streamID := fmt.Sprintf("stream-%d", time.Now().UnixNano())
+	log.Printf("New gRPC stream connected: %s", streamID)
+
+	// Extract client IP from gRPC peer info
+	p, ok := peer.FromContext(stream.Context())
+	if !ok {
+		return errors.New("failed to get peer from context")
+	}
+	clientAddr := p.Addr.String()
+	// Extract IP without port (e.g., "192.168.1.1:12345" -> "192.168.1.1")
+	clientIP := clientAddr
+	if host, _, err := net.SplitHostPort(clientAddr); err == nil {
+		clientIP = host
+	}
+	log.Printf("Client IP from peer: %s", clientIP)
+
+	// Create channel for this stream
+	streamChan := make(chan *pb.ChatMessage, 100)
+	s.activeStreamMu.Lock()
+	s.activeStreams[streamID] = streamChan
+	s.activeStreamMu.Unlock()
+
+	defer func() {
+		s.activeStreamMu.Lock()
+		delete(s.activeStreams, streamID)
+		s.activeStreamMu.Unlock()
+		close(streamChan)
+		log.Printf("gRPC stream disconnected: %s", streamID)
+	}()
+
+	// Authentication flag
+	authenticated := false
+
+	// Goroutine to receive AI responses from client
+	errChan := make(chan error, 1)
+	go func() {
+		for {
+			resp, err := stream.Recv()
+			if err == io.EOF {
+				log.Printf("Client closed stream: %s", streamID)
+				errChan <- nil
+				return
+			}
+			if err != nil {
+				log.Printf("Error receiving AI response: %v", err)
+				errChan <- err
+				return
+			}
+
+			// Verify authentication on first message
+			if !authenticated {
+				if len(resp.AuthSignature) == 0 || resp.AuthTimestamp == 0 {
+					log.Printf("Authentication failed: missing signature or timestamp")
+					errChan <- errors.New("authentication required")
+					return
+				}
+
+				// Check if IP in message matches peer IP
+				if resp.Ip == "" {
+					log.Printf("Authentication failed: missing IP in message")
+					errChan <- errors.New("IP address required in auth message")
+					return
+				}
+
+				// Allow localhost connections to bypass IP matching check
+				isLocalhost := clientIP == "127.0.0.1" || clientIP == "::1" ||
+					clientIP == "localhost" || strings.HasPrefix(clientIP, "[::1]")
+
+				if !isLocalhost && resp.Ip != clientIP {
+					log.Printf("Authentication failed: IP mismatch - message IP: %s, peer IP: %s", resp.Ip, clientIP)
+					errChan <- fmt.Errorf("IP address mismatch: expected %s, got %s", clientIP, resp.Ip)
+					return
+				}
+
+				if isLocalhost {
+					log.Printf("Localhost connection detected, bypassing IP match check (peer IP: %s)", clientIP)
+				}
+
+				// Verify signature over IP + timestamp
+				if err := verifySignature(s.clientPubKey, resp.Ip, resp.AuthTimestamp, resp.AuthSignature); err != nil {
+					log.Printf("Authentication failed: %v", err)
+					errChan <- fmt.Errorf("authentication failed: %v", err)
+					return
+				}
+
+				authenticated = true
+				log.Printf("Client authenticated successfully for stream %s (IP: %s)", streamID, clientIP)
+
+				// Skip processing if this is an auth-only message (empty message_id and text)
+				if resp.MessageId == "" && resp.Text == "" {
+					continue
+				}
+			}
+
+			// Update or append AI message (skip empty messages)
+			if resp.MessageId != "" && resp.Text != "" {
+				// Use nick from response, default to "AI" if not set
+				nick := resp.Nick
+				if nick == "" {
+					nick = "AI"
+				}
+
+				if !s.chatServer.UpdateMessage(resp.MessageId, resp.Text) {
+					aiMsg := Message{
+						ID:    resp.MessageId,
+						Time:  time.Now(),
+						Nick:  nick,
+						Text:  resp.Text, // stream-accumulated message
+						Color: 94,
+					}
+					s.chatServer.AppendMessage(aiMsg)
+				}
+			}
+		}
+	}()
+
+	// Send chat messages to client
+	for {
+		select {
+		case msg, ok := <-streamChan:
+			if !ok {
+				return nil
+			}
+			if err := stream.Send(msg); err != nil {
+				log.Printf("Error sending message to AI: %v", err)
+				return err
+			}
+		case err := <-errChan:
+			return err
+		}
+	}
+}
+
+// BroadcastMessage sends a message to all active gRPC streams
+func (s *gRPCServer) BroadcastMessage(msg Message) {
+	if msg.Nick == "AI" || msg.Nick == "server" {
+		return // Don't send AI or server messages back to AI
+	}
+
+	grpcMsg := &pb.ChatMessage{
+		MessageId: msg.ID,
+		Nick:      msg.Nick,
+		Text:      msg.Text,
+		Timestamp: msg.Time.Unix(),
+		Ip:        msg.IP,
+	}
+
+	s.activeStreamMu.Lock()
+	defer s.activeStreamMu.Unlock()
+
+	for _, streamChan := range s.activeStreams {
+		select {
+		case streamChan <- grpcMsg:
+		default:
+			// Channel full, skip
+		}
+	}
+}
+
+// startGRPCServer starts the gRPC server with TLS only (no client cert verification)
+func startGRPCServer(cs *ChatServer) (*grpc.Server, *gRPCServer, error) {
+	// Load server certificate and key
+	// Using grpc_server_cert.pub and host.key (self-signed for development)
+	cert, err := tls.LoadX509KeyPair("grpc_server_cert.pub", "host.key")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load server cert: %v", err)
+	}
+
+	// Create TLS config without client certificate verification
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.NoClientCert, // Changed from RequireAndVerifyClientCert
+	}
+
+	// Keepalive settings for 24/7 connection stability
+	kaep := grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             5 * time.Second, // Minimum time client should wait before sending keepalive ping
+		PermitWithoutStream: true,            // Allow pings even when there are no active streams
+	})
+
+	kasp := grpc.KeepaliveParams(keepalive.ServerParameters{
+		MaxConnectionIdle:     9999 * time.Minute, // Max time connection can be idle before server sends GOAWAY
+		MaxConnectionAge:      0,                  // Infinite - no max connection age
+		MaxConnectionAgeGrace: 0,                  // Infinite grace period
+		Time:                  30 * time.Second,   // Send keepalive ping every 30 seconds
+		Timeout:               10 * time.Second,   // Wait 10 seconds for keepalive response
+	})
+
+	grpcServer := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(tlsConfig)),
+		kaep,
+		kasp,
+	)
+
+	streamMiddlewareService := newGRPCServer(cs)
+	pb.RegisterStreamMiddlewareServer(grpcServer, streamMiddlewareService)
+
+	return grpcServer, streamMiddlewareService, nil
 }
