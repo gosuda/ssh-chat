@@ -1271,7 +1271,7 @@ func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) err
 						Time:  time.Now(),
 						Nick:  nick,
 						Text:  resp.Text, // stream-accumulated message
-						Color: 94,
+						Color: colors[rand.Intn(len(colors))],
 					}
 					s.chatServer.AppendMessage(aiMsg)
 				}
