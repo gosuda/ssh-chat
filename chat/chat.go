@@ -1,13 +1,216 @@
-package main
+package chat
+
 import (
-	"sync"
-	"github.com/gliderlabs/ssh"
-	_ "./types"
-	"math/rand"
+	"bufio"
 	"context"
+	"errors"
+	"fmt"
+	"log"
+	"math/rand"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unicode"
+
+	"github.com/gliderlabs/ssh"
 )
+
+type Message struct {
+	Time     time.Time
+	Nick     string
+	Text     string
+	Color    int
+	IP       string
+	Mentions []string // List of mentioned usernames
+}
+
+type ChatServer struct {
+	mu        sync.RWMutex
+	messages  []Message
+	clients   map[*Client]struct{}
+	ipCounts  map[string]int  // Track connections per IP
+	nicknames map[string]bool // Track used nicknames
+}
+
+var (
+	globalChat   = NewChatServer()
+	guestCounter uint64
+)
+
+// BanManager keeps a set of banned IP addresses.
+type BanManager struct {
+	mu     sync.RWMutex
+	banned map[string]struct{}
+}
+
+func NewBanManager() *BanManager {
+	return &BanManager{banned: make(map[string]struct{})}
+}
+
+func (b *BanManager) IsBanned(ip string) bool {
+	b.mu.RLock()
+	_, ok := b.banned[ip]
+	b.mu.RUnlock()
+	return ok
+}
+
+func (b *BanManager) Ban(ip string) {
+	b.mu.Lock()
+	b.banned[ip] = struct{}{}
+	b.mu.Unlock()
+}
+
+var banManager = NewBanManager()
+
+func NewChatServer() *ChatServer {
+	cs := &ChatServer{
+		clients:   make(map[*Client]struct{}),
+		ipCounts:  make(map[string]int),
+		nicknames: make(map[string]bool),
+	}
+	welcome := Message{
+		Time:  time.Now(),
+		Nick:  "server",
+		Text:  "Welcome to the SSH chat! Use ↑/↓ to scroll and Enter to send messages.",
+		Color: 37,
+	}
+	cs.messages = append(cs.messages, welcome)
+	cs.logMessage(welcome)
+	return cs
+}
+
+func (cs *ChatServer) AddClient(c *Client) {
+	cs.mu.Lock()
+	cs.clients[c] = struct{}{}
+	cs.ipCounts[c.ip]++
+	cs.nicknames[c.nickname] = true
+	cs.mu.Unlock()
+}
+
+func (cs *ChatServer) RemoveClient(c *Client) {
+	cs.mu.Lock()
+	delete(cs.clients, c)
+	cs.ipCounts[c.ip]--
+	if cs.ipCounts[c.ip] <= 0 {
+		delete(cs.ipCounts, c.ip)
+	}
+	delete(cs.nicknames, c.nickname)
+	cs.mu.Unlock()
+}
+
+func (cs *ChatServer) AppendMessage(msg Message) {
+	// Detect mentions in the message
+	msg.Mentions = extractMentions(msg.Text)
+
+	cs.mu.Lock()
+	cs.messages = append(cs.messages, msg)
+	clients := make([]*Client, 0, len(cs.clients))
+	for c := range cs.clients {
+		clients = append(clients, c)
+	}
+	cs.mu.Unlock()
+
+	cs.logMessage(msg)
+
+	// Send notifications to all clients, with bell for mentioned users
+	for _, client := range clients {
+		isMentioned := false
+		for _, mention := range msg.Mentions {
+			if strings.EqualFold(client.nickname, mention) {
+				isMentioned = true
+				break
+			}
+		}
+		client.NotifyWithBell(isMentioned)
+	}
+}
+
+func (cs *ChatServer) AppendSystemMessage(text string) {
+	cs.AppendMessage(Message{
+		Time:  time.Now(),
+		Nick:  "server",
+		Text:  text,
+		Color: 37,
+	})
+}
+
+// DisconnectByIP closes all clients currently connected from the given IP.
+func (cs *ChatServer) DisconnectByIP(ip string) int {
+	cs.mu.RLock()
+	clients := make([]*Client, 0, len(cs.clients))
+	for c := range cs.clients {
+		if c.ip == ip {
+			clients = append(clients, c)
+		}
+	}
+	cs.mu.RUnlock()
+	for _, c := range clients {
+		// Best-effort notify and close
+		_ = c.session.Exit(1)
+		c.Close()
+	}
+	return len(clients)
+}
+
+func (cs *ChatServer) Messages() []Message {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	out := make([]Message, len(cs.messages))
+	copy(out, cs.messages)
+	return out
+}
+
+func (cs *ChatServer) ClientCount() int {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return len(cs.clients)
+}
+
+// CheckIPLimit returns true if the IP has not exceeded the connection limit (2)
+func (cs *ChatServer) CheckIPLimit(ip string) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cs.ipCounts[ip] < 2
+}
+
+// GetUniqueNickname returns a unique nickname by adding 8-character HEX suffix if needed
+func (cs *ChatServer) GetUniqueNickname(baseNickname string) string {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	// If nickname is not taken, return as-is
+	if !cs.nicknames[baseNickname] {
+		return baseNickname
+	}
+
+	// Generate unique nickname with 8-character HEX suffix
+	for i := 0; i < 100; i++ { // Try up to 100 times to avoid infinite loop
+		suffix := fmt.Sprintf("%08x", rand.Int31())
+		uniqueNickname := fmt.Sprintf("%s-%s", baseNickname, suffix)
+		if !cs.nicknames[uniqueNickname] {
+			return uniqueNickname
+		}
+	}
+
+	// Fallback: use timestamp as suffix
+	suffix := fmt.Sprintf("%08x", time.Now().Unix())
+	return fmt.Sprintf("%s-%s", baseNickname, suffix)
+}
+
+func (cs *ChatServer) logMessage(msg Message) {
+	sanitized := strings.ReplaceAll(msg.Text, "\n", "\\n")
+	if len(sanitized) > 20 {
+		sanitized = sanitized[:20]
+	}
+	if msg.IP != "" {
+		log.Printf("%s [%s@%s] %s", msg.Time.Format(time.RFC3339), msg.Nick, msg.IP, sanitized)
+		return
+	}
+	log.Printf("%s [%s] %s", msg.Time.Format(time.RFC3339), msg.Nick, sanitized)
+}
+
 type Client struct {
 	session ssh.Session
 	server  *ChatServer
@@ -336,32 +539,20 @@ func (c *Client) handleEnter() {
 		IP:    c.ip,
 	})
 
-	if strings.Contains(text, "rm -") {
-		c.server.AppendSystemMessage("이거 리눅스아니에요. 윈도 파워쉘요.")
-	}
-	if strings.Contains(text, "rd ") {
-		c.server.AppendSystemMessage("이거 윈도 아니에요. 리눅스요.")
-	}
 	if strings.Contains(text, "스프링") {
 		c.server.AppendSystemMessage("물러가라 이 사악한 스프링놈아.")
 	}
-	if strings.Contains(text, "자바") && !strings.Contains(text, "자바스") {
+	if strings.Contains(text, "자바") {
 		c.server.AppendSystemMessage("망해라 자바")
 	}
-	if strings.Contains(text, "자스") || strings.Contains(text, "자바스") || strings.Contains(text, "javascript") {
-		c.server.AppendSystemMessage("https://jsisweird.com/")
-	}
-	if strings.Contains(text, "러스트") || strings.Contains(text, "rust") {
+	if strings.Contains(text, "러스트") {
 		c.server.AppendSystemMessage("Go: Kubernetes, fzf, Tailscale, Typescript-go, ... / Rust: nil")
 	}
-	if strings.Contains(text, "파이썬") || strings.Contains(text, "python") {
+	if strings.Contains(text, "파이썬") {
 		c.server.AppendSystemMessage("자기 스스로도 컴파일 못하는 허접한 언어.")
 	}
 	if strings.Contains(text, "고랭") {
-		c.server.AppendSystemMessage("돈 못벌쥬? 마이너쥬?")
-	}
-	if strings.Contains(text, "쿠버네티스") {
-		c.server.AppendSystemMessage("이 방 방장 밥줄이에요. 나쁜말하면 영구 밴")
+		c.server.AppendSystemMessage("돈 못벌쥬? 마이너쥬? ")
 	}
 
 	if strings.Contains(text, "exit") {
@@ -551,176 +742,98 @@ func generateGuestNickname() string {
 	id := atomic.AddUint64(&guestCounter, 1)
 	return fmt.Sprintf("guest-%d", id)
 }
-=======
-package main
 
-import (
-	"bufio"
-	"errors"
-	"fmt"
-	"log"
-	"net"
-	"os"
-	"os/signal"
-	"strings"
-	"sync/atomic"
-	"syscall"
-	"time"
-
-	"github.com/gliderlabs/ssh"
-	"github.com/iwanhae/ssh-chat/chat"
-	"github.com/spf13/cobra"
-)
-
-var (
-	addr              string
-	hostKeyPath       string
-	maxPerIP          int
-	shutdownCountdown time.Duration
-	guestCounter      uint64
-)
-
-func main() {
-	rootCmd := &cobra.Command{
-		Use:   "ssh-chat",
-		Short: "A tiny SSH chat server",
-		Long:  "A tiny SSH chat server using gliderlabs/ssh and a libp2p-friendly chat core.",
-		RunE:  runServe,
-	}
-
-	rootCmd.Flags().StringVar(&addr, "addr", ":2222", "listen address (e.g. :2222 or 0.0.0.0:2222)")
-	rootCmd.Flags().StringVar(&hostKeyPath, "host-key", "host.key", "path to SSH host private key")
-	rootCmd.Flags().IntVar(&maxPerIP, "max-per-ip", 2, "max simultaneous connections allowed per IP")
-	rootCmd.Flags().DurationVar(&shutdownCountdown, "shutdown-countdown", 5*time.Second, "graceful shutdown countdown duration")
-
-	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
+// 범위 기반(명시적 블록) 체크를 추가로 하고 싶다면 아래도 사용
+func isCombiningBlock(r rune) bool {
+	switch {
+	case r >= 0x0300 && r <= 0x036F: // Combining Diacritical Marks
+		return true
+	case r >= 0x1AB0 && r <= 0x1AFF: // Combining Diacritical Marks Extended
+		return true
+	case r >= 0x1DC0 && r <= 0x1DFF: // Combining Diacritical Marks Supplement
+		return true
+	case r >= 0x20D0 && r <= 0x20FF: // Combining Diacritical Marks for Symbols
+		return true
+	case r >= 0xFE20 && r <= 0xFE2F: // Combining Half Marks
+		return true
+	default:
+		return false
 	}
 }
 
-func runServe(cmd *cobra.Command, args []string) error {
-	quitCh := make(chan os.Signal, 1)
-	signal.Notify(quitCh, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+func isBlockedRune(r rune) bool {
+	// 범주 기반(Mn/Me) + 범위 기반을 모두 허용
+	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
+		return true
+	}
+	return isCombiningBlock(r)
+}
 
-	banManager := chat.NewBanManager()
-	globalChat := chat.NewChatServer()
+// extractMentions finds all @username mentions in a message
+func extractMentions(text string) []string {
+	var mentions []string
+	words := strings.Fields(text)
 
-	// SSH 세션 핸들러
-	h := func(s ssh.Session) {
-		ptyReq, winCh, isPty := s.Pty()
-		if !isPty {
-			fmt.Fprintln(s, "Error: PTY required. Reconnect with -t option.")
-			_ = s.Exit(1)
-			return
+	for _, word := range words {
+		if strings.HasPrefix(word, "@") {
+			// Remove @ and any trailing punctuation
+			mention := strings.TrimPrefix(word, "@")
+			mention = strings.TrimFunc(mention, func(r rune) bool {
+				return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+			})
+			if mention != "" {
+				mentions = append(mentions, mention)
+			}
 		}
-
-		reader := bufio.NewReader(s)
-
-		remote := s.RemoteAddr().String()
-		ip := remote
-		if host, _, err := net.SplitHostPort(remote); err == nil {
-			ip = host
-		}
-
-		if banManager.IsBanned(ip) {
-			fmt.Fprintln(s, "Your IP is banned.")
-			_ = s.Exit(1)
-			return
-		}
-
-		if !globalChat.CheckIPLimit(ip) {
-			fmt.Fprintln(s, "Connection limit exceeded for this IP.")
-			_ = s.Exit(1)
-			return
-		}
-
-		nickname := strings.TrimSpace(s.User())
-		if nickname == "" {
-			nickname = generateGuestNickname()
-		}
-		if len([]rune(nickname)) > 10 {
-			nickname = string([]rune(nickname)[:10])
-		}
-
-		finalNickname := globalChat.GetUniqueNickname(nickname)
-
-		client := chat.NewClient(globalChat, s, finalNickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), ip)
-		globalChat.AddClient(client)
-		defer func() {
-			globalChat.RemoveClient(client)
-			client.Close()
-			globalChat.AppendSystemMessage(fmt.Sprintf("%s left the chat", finalNickname))
-		}()
-
-		// 화면 초기화 & 입장 알림
-		fmt.Fprint(s, "\x1b[2J\x1b[H")
-		globalChat.AppendSystemMessage(fmt.Sprintf("%s joined the chat", finalNickname))
-
-		// 창 사이즈 모니터링 + 메시지 루프
-		go client.MonitorWindow(winCh)
-		client.Start(reader, s.Context())
-		client.Wait()
 	}
 
-	// 서버 생성
-	srv := &ssh.Server{
-		Addr:    addr,
-		Handler: h,
+	return mentions
+}
+
+// highlightMentions adds highlighting to mentioned usernames in the message text
+func highlightMentions(text string, mentions []string) string {
+	if len(mentions) == 0 {
+		return text
 	}
 
-	if err := srv.SetOption(ssh.HostKeyFile(hostKeyPath)); err != nil {
-		return fmt.Errorf("failed to load host key: %w", err)
-	}
+	result := text
+	for _, mention := range mentions {
+		// Create patterns for @username and @username with punctuation
+		pattern := "@" + mention
+		highlighted := fmt.Sprintf("\x1b[1;33m%s\x1b[0m", pattern) // Bold yellow
+		result = strings.ReplaceAll(result, pattern, highlighted)
 
-	// 서버 실행
-	errCh := make(chan error, 1)
-	go func() {
-		log.Printf("starting ssh chat server on %s ...", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
-			errCh <- err
+		// Also handle case where mention might have punctuation after it
+		patterns := []string{
+			"@" + mention + ",",
+			"@" + mention + ".",
+			"@" + mention + "!",
+			"@" + mention + "?",
+			"@" + mention + ":",
+			"@" + mention + ";",
 		}
-	}()
 
-	// 종료 대기
-	select {
-	case sig := <-quitCh:
-		log.Printf("received signal: %v", sig)
-	case err := <-errCh:
-		log.Printf("ssh server error: %v", err)
+		for _, p := range patterns {
+			if strings.Contains(result, p) {
+				// Find the index and replace with highlighted version plus punctuation
+				parts := strings.SplitN(p, "@"+mention, 2)
+				if len(parts) == 2 {
+					highlightedWithPunct := fmt.Sprintf("\x1b[1;33m@%s\x1b[0m%s", mention, parts[1])
+					result = strings.ReplaceAll(result, p, highlightedWithPunct)
+				}
+			}
+		}
 	}
 
-	runShutdownSequence(globalChat, shutdownCountdown)
+	return result
+}
 
-	// 새 연결 막고 종료
-	_ = srv.Close()
+func ValidateNoCombining(input string) error {
+	// 혹시 모를 누락을 대비해 룬 단위로 다시 점검(보수적)
+	for _, r := range input {
+		if isBlockedRune(r) {
+			return errors.New("input contains combining diacritical marks (blocked)")
+		}
+	}
 	return nil
-}
-
-func runShutdownSequence(globalChat *chat.ChatServer, countdown time.Duration) {
-	if countdown <= 0 {
-		return
-	}
-	sec := int(countdown.Seconds())
-	globalChat.AppendSystemMessage(fmt.Sprintf("서버 폭파 %d초 전", sec))
-	for i := sec; i >= 0; i-- {
-		time.Sleep(time.Second)
-		globalChat.AppendSystemMessage(fmt.Sprintf("%d 초", i))
-	}
-	globalChat.AppendSystemMessage("💥💥💥💥💥")
-	globalChat.AppendSystemMessage("아마 관리자가 부지런하면 금방 복구할꺼에요.")
-	globalChat.AppendSystemMessage("💥💥💥💥💥")
-	time.Sleep(time.Second)
-	globalChat.AppendSystemMessage("뭐야 왜 안터져")
-	time.Sleep(time.Second)
-	globalChat.AppendSystemMessage("???")
-	time.Sleep(time.Second)
-	globalChat.AppendSystemMessage("???????")
-	time.Sleep(time.Second)
-	globalChat.AppendSystemMessage("????????????")
-	time.Sleep(500 * time.Millisecond)
-}
-
-func generateGuestNickname() string {
-	id := atomic.AddUint64(&guestCounter, 1)
-	return fmt.Sprintf("guest-%d", id)
 }
