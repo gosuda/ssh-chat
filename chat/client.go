@@ -344,8 +344,11 @@ func (c *Client) handleEnter() {
 	if strings.Contains(text, "스프링") {
 		c.server.AppendSystemMessage("물러가라 이 사악한 스프링놈아.")
 	}
-	if strings.Contains(text, "자바") {
+	if strings.Contains(text, "자바") && !strings.Contains(text, "자바스") {
 		c.server.AppendSystemMessage("망해라 자바")
+	}
+	if strings.Contains(text, "자스") || strings.Contains(text, "자바스") || strings.Contains(text, "javascript") || strings.Contains(text, "js") {
+		c.server.AppendSystemMessage("자바스크립트는 가장 현대적이고 아름다운 언어입니다. 감사합니다.")
 	}
 	if strings.Contains(text, "러스트") {
 		c.server.AppendSystemMessage("Go: Kubernetes, fzf, Tailscale, Typescript-go, ... / Rust: nil")
