@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -50,9 +51,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	banManager := chat.NewBanManager()
 	globalChat := chat.NewChatServer()
-	globalChat.SetMaxPerIP(maxPerIP)
 
-	handler := func(s ssh.Session) {
+	// SSH 세션 핸들러
+	h := func(s ssh.Session) {
 		ptyReq, winCh, isPty := s.Pty()
 		if !isPty {
 			fmt.Fprintln(s, "Error: PTY required. Reconnect with -t option.")
@@ -90,7 +91,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 		finalNickname := globalChat.GetUniqueNickname(nickname)
 
-		client := chat.NewClient(globalChat, s, finalNickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), ip)
+		var colors = []int{
+			31, 32, 33, 34, 35, 36,
+		}
+		client := chat.NewClient(globalChat, banManager, s, finalNickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), colors[rand.Intn(len(colors))], ip)
 		globalChat.AddClient(client)
 		defer func() {
 			globalChat.RemoveClient(client)
@@ -98,31 +102,36 @@ func runServe(cmd *cobra.Command, args []string) error {
 			globalChat.AppendSystemMessage(fmt.Sprintf("%s left the chat", finalNickname))
 		}()
 
+		// 화면 초기화 & 입장 알림
 		fmt.Fprint(s, "\x1b[2J\x1b[H")
 		globalChat.AppendSystemMessage(fmt.Sprintf("%s joined the chat", finalNickname))
 
+		// 창 사이즈 모니터링 + 메시지 루프
 		go client.MonitorWindow(winCh)
 		client.Start(reader, s.Context())
 		client.Wait()
 	}
 
-	server := &ssh.Server{
+	// 서버 생성
+	srv := &ssh.Server{
 		Addr:    addr,
-		Handler: handler,
+		Handler: h,
 	}
 
-	if err := server.SetOption(ssh.HostKeyFile(hostKeyPath)); err != nil {
+	if err := srv.SetOption(ssh.HostKeyFile(hostKeyPath)); err != nil {
 		return fmt.Errorf("failed to load host key: %w", err)
 	}
 
+	// 서버 실행
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("starting ssh chat server on %s ...", addr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
 			errCh <- err
 		}
 	}()
 
+	// 종료 대기
 	select {
 	case sig := <-quitCh:
 		log.Printf("received signal: %v", sig)
@@ -132,7 +141,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	runShutdownSequence(globalChat, shutdownCountdown)
 
-	_ = server.Close()
+	// 새 연결 막고 종료
+	_ = srv.Close()
 	return nil
 }
 
