@@ -17,4 +17,4 @@ COPY --from=build /go/src/app/host.key /
 
 EXPOSE 22
 
-CMD ["/app", "-addr", ":22", "-host-key", "/host.key"]
+CMD ["/app", "--addr", ":22", "--host-key", "/host.key"]
