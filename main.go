@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -57,6 +58,12 @@ var (
 	globalChat   = NewChatServer()
 	guestCounter uint64
 	grpcService  *gRPCServer
+
+	// Command-line flags
+	grpcSecurityMode = flag.String("grpc-security", "none", "gRPC security mode: none, tls, mtls")
+	grpcPort         = flag.String("grpc-port", "3333", "gRPC server port")
+	sshPort          = flag.String("ssh-port", "2222", "SSH server port")
+	grpcAuthEnabled  = flag.Bool("grpc-auth", false, "Enable signature-based authentication for gRPC (requires ai_grpc_client.pub)")
 )
 
 // BanManager keeps a set of banned IP addresses.
@@ -845,6 +852,8 @@ func generateGuestNickname() string {
 }
 
 func main() {
+	flag.Parse()
+
 	quitCh := make(chan os.Signal, 1)
 	signal.Notify(quitCh, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 
@@ -911,25 +920,25 @@ func main() {
 
 	// 서버를 객체로 만들어서 Close 할 수 있게
 	srv := &ssh.Server{
-		Addr:    ":2222",
+		Addr:    ":" + *sshPort,
 		Handler: h,
 	}
 	srv.SetOption(ssh.HostKeyFile("host.key"))
 
-	// Start gRPC server
-	grpcServer, grpcSvc, err := startGRPCServer(globalChat)
+	// Start gRPC server with specified security mode
+	grpcServer, grpcSvc, err := startGRPCServer(globalChat, *grpcSecurityMode)
 	if err != nil {
 		log.Printf("Failed to start gRPC server: %v", err)
 		log.Println("Continuing without gRPC AI integration...")
 	} else {
 		grpcService = grpcSvc
-		grpcListener, err := net.Listen("tcp", ":3333")
+		grpcListener, err := net.Listen("tcp", ":"+*grpcPort)
 		if err != nil {
-			log.Fatalf("Failed to listen on port 3333: %v", err)
+			log.Fatalf("Failed to listen on port %s: %v", *grpcPort, err)
 		}
 
 		go func() {
-			log.Println("starting gRPC AI server on port 3333...")
+			log.Printf("starting gRPC AI server on port %s (security: %s)...", *grpcPort, *grpcSecurityMode)
 			if err := grpcServer.Serve(grpcListener); err != nil {
 				log.Printf("gRPC server error: %v", err)
 			}
@@ -943,7 +952,7 @@ func main() {
 
 	// 서버 실행은 고루틴에서; log.Fatal 쓰지 마세요
 	go func() {
-		log.Println("starting ssh chat server on port 2222...")
+		log.Printf("starting ssh chat server on port %s...", *sshPort)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
 			// 여기서 종료하지 않음
 			log.Printf("ssh server error: %v", err)
@@ -1144,20 +1153,29 @@ type gRPCServer struct {
 	activeStreamMu sync.Mutex
 	activeStreams  map[string]chan *pb.ChatMessage
 	clientPubKey   *ecdsa.PublicKey // Client's public key for authentication
+	authEnabled    bool             // Whether signature authentication is enabled
 }
 
-func newGRPCServer(cs *ChatServer) *gRPCServer {
-	// Load client's public key for authentication
-	pubKey, err := loadClientPublicKey("ai_grpc_client.pub")
-	if err != nil {
-		log.Fatalf("Failed to load client public key: %v", err)
+func newGRPCServer(cs *ChatServer, authEnabled bool) *gRPCServer {
+	var pubKey *ecdsa.PublicKey
+
+	if authEnabled {
+		// Load client's public key for authentication
+		var err error
+		pubKey, err = loadClientPublicKey("ai_grpc_client.pub")
+		if err != nil {
+			log.Fatalf("Failed to load client public key (required when -grpc-auth is enabled): %v", err)
+		}
+		log.Println("Loaded client public key for signature authentication")
+	} else {
+		log.Println("Signature-based authentication is disabled")
 	}
-	log.Println("Loaded client public key for authentication")
 
 	return &gRPCServer{
 		chatServer:    cs,
 		activeStreams: make(map[string]chan *pb.ChatMessage),
 		clientPubKey:  pubKey,
+		authEnabled:   authEnabled,
 	}
 }
 
@@ -1194,7 +1212,7 @@ func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) err
 	}()
 
 	// Authentication flag
-	authenticated := false
+	authenticated := !s.authEnabled // If auth is disabled, consider already authenticated
 
 	// Goroutine to receive AI responses from client
 	errChan := make(chan error, 1)
@@ -1212,8 +1230,8 @@ func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) err
 				return
 			}
 
-			// Verify authentication on first message
-			if !authenticated {
+			// Verify authentication on first message (only if auth is enabled)
+			if s.authEnabled && !authenticated {
 				if len(resp.AuthSignature) == 0 || resp.AuthTimestamp == 0 {
 					log.Printf("Authentication failed: missing signature or timestamp")
 					errChan <- errors.New("authentication required")
@@ -1322,20 +1340,9 @@ func (s *gRPCServer) BroadcastMessage(msg Message) {
 	}
 }
 
-// startGRPCServer starts the gRPC server with TLS only (no client cert verification)
-func startGRPCServer(cs *ChatServer) (*grpc.Server, *gRPCServer, error) {
-	// Load server certificate and key
-	// Using grpc_server_cert.pub and host.key (self-signed for development)
-	cert, err := tls.LoadX509KeyPair("grpc_server_cert.pub", "host.key")
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load server cert: %v", err)
-	}
-
-	// Create TLS config without client certificate verification
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.NoClientCert, // Changed from RequireAndVerifyClientCert
-	}
+// startGRPCServer starts the gRPC server with specified security mode
+func startGRPCServer(cs *ChatServer, securityMode string) (*grpc.Server, *gRPCServer, error) {
+	var grpcServer *grpc.Server
 
 	// Keepalive settings for 24/7 connection stability
 	kaep := grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
@@ -1351,13 +1358,67 @@ func startGRPCServer(cs *ChatServer) (*grpc.Server, *gRPCServer, error) {
 		Timeout:               10 * time.Second,   // Wait 10 seconds for keepalive response
 	})
 
-	grpcServer := grpc.NewServer(
-		grpc.Creds(credentials.NewTLS(tlsConfig)),
-		kaep,
-		kasp,
-	)
+	switch securityMode {
+	case "none":
+		// No TLS - insecure connection
+		log.Println("Starting gRPC server without TLS (insecure mode)")
+		grpcServer = grpc.NewServer(kaep, kasp)
 
-	streamMiddlewareService := newGRPCServer(cs)
+	case "tls":
+		// TLS only - no client certificate verification
+		log.Println("Starting gRPC server with TLS (server cert only)")
+		cert, err := tls.LoadX509KeyPair("grpc_server.cert", "host.key")
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load server cert: %v", err)
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ClientAuth:   tls.NoClientCert,
+		}
+
+		grpcServer = grpc.NewServer(
+			grpc.Creds(credentials.NewTLS(tlsConfig)),
+			kaep,
+			kasp,
+		)
+
+	case "mtls":
+		// Mutual TLS - both server and client certificates
+		log.Println("Starting gRPC server with mTLS (mutual authentication)")
+		cert, err := tls.LoadX509KeyPair("grpc_server.cert", "host.key")
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load server cert: %v", err)
+		}
+
+		// Load client CA certificate
+		clientCA, err := os.ReadFile("ai_grpc_client.ca.cert")
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load client CA cert: %v", err)
+		}
+
+		clientCertPool := x509.NewCertPool()
+		if !clientCertPool.AppendCertsFromPEM(clientCA) {
+			return nil, nil, errors.New("failed to add client CA cert to pool")
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			ClientCAs:    clientCertPool,
+		}
+
+		grpcServer = grpc.NewServer(
+			grpc.Creds(credentials.NewTLS(tlsConfig)),
+			kaep,
+			kasp,
+		)
+
+	default:
+		return nil, nil, fmt.Errorf("invalid security mode: %s (use: none, tls, mtls)", securityMode)
+	}
+
+	streamMiddlewareService := newGRPCServer(cs, *grpcAuthEnabled)
 	pb.RegisterStreamMiddlewareServer(grpcServer, streamMiddlewareService)
 
 	return grpcServer, streamMiddlewareService, nil
