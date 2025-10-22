@@ -1,6 +1,6 @@
 module github.com/iwanhae/ssh-chat
 
-go 1.24.2
+go 1.25.3
 
 require (
 	github.com/gliderlabs/ssh v0.3.8
