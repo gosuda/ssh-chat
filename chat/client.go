@@ -167,7 +167,7 @@ func (c *Client) render() {
 	for i := len(allMessages) - 1; i >= 0; i-- {
 		msg := allMessages[i]
 		// 색 변경을 여기서 파싱합니다.
-		if strings.Contains(msg.Text, "#색") {
+		if strings.Contains(msg.Text, "@색") {
 			color := strings.Split(msg.Text, " ")[1]
 			changeColor(color, &msg);
 		}
