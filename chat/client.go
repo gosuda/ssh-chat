@@ -166,6 +166,11 @@ func (c *Client) render() {
 	// 전체 메시지를 역순으로 순회합니다.
 	for i := len(allMessages) - 1; i >= 0; i-- {
 		msg := allMessages[i]
+		// 색 변경을 여기서 파싱합니다.
+		if strings.Contains(msg.Text, "@색") {
+			color := strings.Split(msg.Text, " ")[1]
+			changeColor(color, &msg);
+		}
 		// 메시지 하나를 포맷팅하여 라인들로 변환합니다.
 		msgLines := formatMessage(msg, width)
 
@@ -414,6 +419,25 @@ func (c *Client) handleEscape(reader *bufio.Reader) {
 
 func isControlRune(r rune) bool {
 	return r < 32 || r == 127
+}
+
+func changeColor(color string, msg *Message) {
+	if color == "빨강" || strings.Contains(color, "빨") {
+		msg.Color = 31
+	} else if color == "녹색" || strings.Contains(color, "초") {
+		msg.Color = 32
+	// 터미널의 어두운 노란색은 갈색처럼 표시되니까 이렇게 둘을 넣어줍니다.
+	} else if strings.Contains(color, "노") || strings.Contains(color, "갈") {
+		msg.Color = 33
+	} else if strings.Contains(color, "파") {
+		msg.Color = 34
+	// 환경에 따라 마젠타가 자주색이거나 분홍색이니 마찬가지로 처리합니다.
+	} else if strings.Contains(color, "자") || strings.Contains(color, "분") {
+		msg.Color = 35
+	// 대체로 이것은 하늘색이지만 ANSI에서는 청록이라고 정의합니다.
+	} else if strings.Contains(color, "하늘") || strings.Contains(color, "청록") {
+		msg.Color = 36
+	}
 }
 
 // [HELPER] O(n) 로직을 분리하기 위해, 메시지 '하나'만 포맷하는 헬퍼 함수를 만들었습니다.
