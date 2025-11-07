@@ -25,6 +25,7 @@ var (
 	maxPerIP          int
 	shutdownCountdown time.Duration
 	guestCounter      uint64
+	dbPath            string // SQLite 데이터베이스 파일 경로
 )
 
 func main() {
@@ -39,6 +40,7 @@ func main() {
 	rootCmd.Flags().StringVar(&hostKeyPath, "host-key", "host.key", "path to SSH host private key")
 	rootCmd.Flags().IntVar(&maxPerIP, "max-per-ip", 2, "max simultaneous connections allowed per IP")
 	rootCmd.Flags().DurationVar(&shutdownCountdown, "shutdown-countdown", 5*time.Second, "graceful shutdown countdown duration")
+	rootCmd.Flags().StringVar(&dbPath, "db-path", "chat.db", "path to SQLite database file") // dbPath 플래그 추가
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -50,7 +52,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	signal.Notify(quitCh, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 
 	banManager := chat.NewBanManager()
-	globalChat := chat.NewChatServer()
+	globalChat, err := chat.NewChatServer(dbPath) // dbPath 전달 및 에러 처리
+	if err != nil {
+		return fmt.Errorf("채팅 서버 초기화 실패: %w", err)
+	}
+	defer globalChat.Close() // 서버 종료 시 데이터베이스 연결 닫기
 
 	// SSH 세션 핸들러
 	h := func(s ssh.Session) {
@@ -112,38 +118,59 @@ func runServe(cmd *cobra.Command, args []string) error {
 		client.Wait()
 	}
 
-	// 서버 생성
-	srv := &ssh.Server{
-		Addr:    addr,
-		Handler: h,
-	}
+	return startAndMonitorServer(addr, hostKeyPath, h, globalChat, shutdownCountdown, quitCh)
+}
 
-	if err := srv.SetOption(ssh.HostKeyFile(hostKeyPath)); err != nil {
-		return fmt.Errorf("failed to load host key: %w", err)
-	}
-
-	// 서버 실행
-	errCh := make(chan error, 1)
-	go func() {
-		log.Printf("starting ssh chat server on %s ...", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
-			errCh <- err
+// startAndMonitorServer는 SSH 서버를 시작하고 비정상 종료 시 재시작 로직을 처리합니다.
+func startAndMonitorServer(
+	addr string,
+	hostKeyPath string,
+	h ssh.Handler,
+	globalChat *chat.ChatServer,
+	shutdownCountdown time.Duration,
+	quitCh chan os.Signal,
+) error {
+	// 서버 자동 재시작 루프
+	for {
+		// 서버 생성
+		srv := &ssh.Server{
+			Addr:    addr,
+			Handler: h,
 		}
-	}()
 
-	// 종료 대기
-	select {
-	case sig := <-quitCh:
-		log.Printf("received signal: %v", sig)
-	case err := <-errCh:
-		log.Printf("ssh server error: %v", err)
+		if err := srv.SetOption(ssh.HostKeyFile(hostKeyPath)); err != nil {
+			return fmt.Errorf("failed to load host key: %w", err)
+		}
+
+		errCh := make(chan error, 1)
+		go func() {
+			// 패닉 발생 시 복구 및 에러 채널로 전송
+			defer func() {
+				if r := recover(); r != nil {
+					err := fmt.Errorf("panic in ListenAndServe goroutine: %v", r)
+					log.Printf("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥: %v", err) // 패닉 알림
+					errCh <- err // 외부 루프에 패닉 발생 알림
+				}
+			}()
+			log.Printf("starting ssh chat server on %s ...", addr)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errCh <- err
+			}
+		}()
+
+		select {
+		case sig := <-quitCh:
+			log.Printf("received signal: %v", sig)
+			runShutdownSequence(globalChat, shutdownCountdown)
+			_ = srv.Close() // 새 연결 막고 종료
+			return nil
+		case err := <-errCh:
+			log.Printf("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥: %v", err) // 서버 죽음 알림
+			globalChat.AppendSystemMessage("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥") // 클라이언트에게도 알림
+			_ = srv.Close() // 현재 서버 인스턴스 종료
+			// 루프의 다음 반복에서 새 서버 인스턴스가 생성됩니다.
+		}
 	}
-
-	runShutdownSequence(globalChat, shutdownCountdown)
-
-	// 새 연결 막고 종료
-	_ = srv.Close()
-	return nil
 }
 
 func runShutdownSequence(globalChat *chat.ChatServer, countdown time.Duration) {

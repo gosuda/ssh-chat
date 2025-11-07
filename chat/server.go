@@ -9,16 +9,25 @@ import (
 	"time"
 )
 
-type ChatServer struct {
+	type ChatServer struct {
 	mu        sync.RWMutex
-	messages  []Message
+	store     MessageStore // 메시지 저장소 인터페이스
 	clients   map[*Client]struct{}
-	ipCounts  map[string]int  // Track connections per IP
-	nicknames map[string]bool // Track used nicknames
+	ipCounts  map[string]int  // IP당 연결 수 추적
+	nicknames map[string]bool // 사용 중인 닉네임 추적
 }
+func NewChatServer(dbPath string) (*ChatServer, error) {
+	store, err := NewSQLiteMessageStore(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("SQLite 메시지 저장소 생성 실패: %w", err)
+	}
 
-func NewChatServer() *ChatServer {
+	if err := store.Init(); err != nil {
+		return nil, fmt.Errorf("메시지 저장소 초기화 실패: %w", err)
+	}
+
 	cs := &ChatServer{
+		store:     store,
 		clients:   make(map[*Client]struct{}),
 		ipCounts:  make(map[string]int),
 		nicknames: make(map[string]bool),
@@ -29,9 +38,12 @@ func NewChatServer() *ChatServer {
 		Text:  "Welcome to the SSH chat! Use ↑/↓ to scroll and Enter to send messages.",
 		Color: 37,
 	}
-	cs.messages = append(cs.messages, welcome)
+	// 환영 메시지를 데이터베이스에 저장
+	if err := cs.store.AppendMessage(welcome); err != nil {
+		log.Printf("환영 메시지 저장 실패: %v", err)
+	}
 	cs.logMessage(welcome)
-	return cs
+	return cs, nil
 }
 
 func (cs *ChatServer) AddClient(c *Client) {
@@ -54,11 +66,15 @@ func (cs *ChatServer) RemoveClient(c *Client) {
 }
 
 func (cs *ChatServer) AppendMessage(msg Message) {
-	// Detect mentions in the message
+	// 메시지에서 멘션 감지
 	msg.Mentions = extractMentions(msg.Text)
 
+	// 메시지를 데이터베이스에 저장
+	if err := cs.store.AppendMessage(msg); err != nil {
+		log.Printf("메시지 데이터베이스 저장 실패: %v", err)
+	}
+
 	cs.mu.Lock()
-	cs.messages = append(cs.messages, msg)
 	clients := make([]*Client, 0, len(cs.clients))
 	for c := range cs.clients {
 		clients = append(clients, c)
@@ -67,7 +83,7 @@ func (cs *ChatServer) AppendMessage(msg Message) {
 
 	cs.logMessage(msg)
 
-	// Send notifications to all clients, with bell for mentioned users
+	// 모든 클라이언트에게 알림 전송, 멘션된 사용자에게는 벨 소리 포함
 	for _, client := range clients {
 		isMentioned := false
 		for _, mention := range msg.Mentions {
@@ -108,11 +124,19 @@ func (cs *ChatServer) DisconnectByIP(ip string) int {
 }
 
 func (cs *ChatServer) Messages() []Message {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	out := make([]Message, len(cs.messages))
-	copy(out, cs.messages)
-	return out
+	// 최신 100개의 메시지를 데이터베이스에서 조회
+	messages, err := cs.store.GetMessages(0, 100)
+	if err != nil {
+		log.Printf("메시지 조회 실패: %v", err)
+		return nil
+	}
+	return messages
+}
+
+// Close는 ChatServer의 리소스를 정리합니다 (예: 데이터베이스 연결 닫기).
+func (cs *ChatServer) Close() error {
+	log.Println("ChatServer 리소스 정리 중...")
+	return cs.store.Close()
 }
 
 func (cs *ChatServer) ClientCount() int {
