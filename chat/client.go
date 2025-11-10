@@ -338,6 +338,7 @@ func (c *Client) handleEnter() {
 	}
 
 	c.server.AppendMessage(Message{
+		Time:  getTimeInSeoul(),
 		Nick:  c.nickname,
 		Text:  text,
 		Color: c.color,

@@ -33,7 +33,7 @@ func NewChatServer(dbPath string) (*ChatServer, error) {
 		nicknames: make(map[string]bool),
 	}
 	welcome := Message{
-		Time:  time.Now(),
+		Time:  getTimeInSeoul(),
 		Nick:  "server",
 		Text:  "Welcome to the SSH chat! Use ↑/↓ to scroll and Enter to send messages.",
 		Color: 37,
@@ -68,7 +68,6 @@ func (cs *ChatServer) RemoveClient(c *Client) {
 func (cs *ChatServer) AppendMessage(msg Message) {
 	// 메시지에서 멘션 감지
 	msg.Mentions = extractMentions(msg.Text)
-	msg.Time = time.Now()
 
 	// 메시지를 데이터베이스에 저장
 	if err := cs.store.AppendMessage(msg); err != nil {
@@ -99,7 +98,7 @@ func (cs *ChatServer) AppendMessage(msg Message) {
 
 func (cs *ChatServer) AppendSystemMessage(text string) {
 	cs.AppendMessage(Message{
-		Time:  time.Now(),
+		Time:  getTimeInSeoul(),
 		Nick:  "server",
 		Text:  text,
 		Color: 37,
@@ -187,4 +186,15 @@ func (cs *ChatServer) logMessage(msg Message) {
 		return
 	}
 	log.Printf("%s [%s] %s", msg.Time.Format(time.RFC3339), msg.Nick, sanitized)
+}
+
+// getTimeInSeoul returns the current time in the Asia/Seoul timezone.
+// It falls back to UTC if the timezone cannot be loaded.
+func getTimeInSeoul() time.Time {
+	loc, err := time.LoadLocation("Asia/Seoul")
+	if err != nil {
+		log.Printf("Error loading Asia/Seoul timezone: %v. Using UTC.", err)
+		return time.Now().UTC()
+	}
+	return time.Now().In(loc)
 }
