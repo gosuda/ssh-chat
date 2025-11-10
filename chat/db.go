@@ -95,15 +95,19 @@ func (s *SQLiteMessageStore) GetMessages(offset, limit int) ([]Message, error) {
 			return nil, fmt.Errorf("메시지 스캔 실패: %w", err)
 		}
 
-		msg.Time, err = time.Parse("2006-01-02 15:04:05-07:00", timestampStr) // SQLite DATETIME 형식에 맞게 파싱
+		// SQLite는 time.Time을 RFC3339 형식의 문자열로 저장합니다.
+		// 먼저 RFC3339 형식으로 파싱을 시도합니다.
+		parsedTime, err := time.Parse(time.RFC3339, timestampStr)
 		if err != nil {
-			// 다른 형식일 경우 시도 (예: "YYYY-MM-DD HH:MM:SS")
-			msg.Time, err = time.Parse("2006-01-02 15:04:05", timestampStr)
+			// RFC3339 파싱에 실패하면 이전 형식으로 시도합니다.
+			parsedTime, err = time.Parse("2006-01-02 15:04:05", timestampStr)
 			if err != nil {
 				log.Printf("경고: 타임스탬프 파싱 실패 (%s): %v", timestampStr, err)
-				msg.Time = time.Now() // 기본값 설정
+				// 파싱에 실패하면 msg.Time은 time.Time의 제로 값으로 유지됩니다.
+				// time.Now()로 설정하지 않아 시간이 계속 업데이트되는 버그를 방지합니다.
 			}
 		}
+		msg.Time = parsedTime
 
 		if ipStr.Valid {
 			msg.IP = ipStr.String
