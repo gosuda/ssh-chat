@@ -68,6 +68,7 @@ func (cs *ChatServer) RemoveClient(c *Client) {
 func (cs *ChatServer) AppendMessage(msg Message) {
 	// 메시지에서 멘션 감지
 	msg.Mentions = extractMentions(msg.Text)
+	msg.Time = time.Now()
 
 	// 메시지를 데이터베이스에 저장
 	if err := cs.store.AppendMessage(msg); err != nil {

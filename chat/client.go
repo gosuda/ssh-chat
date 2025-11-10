@@ -295,10 +295,8 @@ func (c *Client) handleEnter() {
 		return
 	}
 
-	messageTime := time.Now()
-
 	c.mu.Lock()
-	oneMinuteAgo := messageTime.Add(-time.Minute)
+	oneMinuteAgo := time.Now().Add(-time.Minute)
 
 	// Filter timestamps older than one minute
 	n := 0
@@ -311,7 +309,7 @@ func (c *Client) handleEnter() {
 	c.messageTimestamps = c.messageTimestamps[:n]
 
 	// Add current message timestamp
-	c.messageTimestamps = append(c.messageTimestamps, messageTime)
+	c.messageTimestamps = append(c.messageTimestamps, time.Now())
 	messageCount := len(c.messageTimestamps)
 	c.mu.Unlock()
 
@@ -340,7 +338,6 @@ func (c *Client) handleEnter() {
 	}
 
 	c.server.AppendMessage(Message{
-		Time:  messageTime,
 		Nick:  c.nickname,
 		Text:  text,
 		Color: c.color,
