@@ -8,9 +8,9 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-buildid=' -o /go/bin/app .
+RUN CGO_ENABLED=1 go build -tags timetzdata -trimpath -ldflags='-buildid=' -o /go/bin/app .
 
-FROM gcr.io/distroless/static-debian12
+FROM gcr.io/distroless/cc-debian12
 
 COPY --from=build /go/bin/app /
 COPY --from=build /go/src/app/host.key /
