@@ -11,7 +11,7 @@ import (
 
 	type ChatServer struct {
 	mu        sync.RWMutex
-	store     MessageStore // 메시지 저장소 인터페이스
+	Store     MessageStore // 메시지 저장소 인터페이스
 	clients   map[*Client]struct{}
 	ipCounts  map[string]int  // IP당 연결 수 추적
 	nicknames map[string]bool // 사용 중인 닉네임 추적
@@ -27,7 +27,7 @@ func NewChatServer(dbPath string) (*ChatServer, error) {
 	}
 
 	cs := &ChatServer{
-		store:     store,
+		Store:     store,
 		clients:   make(map[*Client]struct{}),
 		ipCounts:  make(map[string]int),
 		nicknames: make(map[string]bool),
@@ -39,7 +39,7 @@ func NewChatServer(dbPath string) (*ChatServer, error) {
 		Color: 37,
 	}
 	// 환영 메시지를 데이터베이스에 저장
-	if err := cs.store.AppendMessage(welcome); err != nil {
+	if err := cs.Store.AppendMessage(welcome); err != nil {
 		log.Printf("환영 메시지 저장 실패: %v", err)
 	}
 	cs.logMessage(welcome)
@@ -70,7 +70,7 @@ func (cs *ChatServer) AppendMessage(msg Message) {
 	msg.Mentions = extractMentions(msg.Text)
 
 	// 메시지를 데이터베이스에 저장
-	if err := cs.store.AppendMessage(msg); err != nil {
+	if err := cs.Store.AppendMessage(msg); err != nil {
 		log.Printf("메시지 데이터베이스 저장 실패: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func (cs *ChatServer) DisconnectByIP(ip string) int {
 
 func (cs *ChatServer) Messages() []Message {
 	// 최신 100개의 메시지를 데이터베이스에서 조회
-	messages, err := cs.store.GetMessages(0, 100)
+	messages, err := cs.Store.GetMessages(0, 100)
 	if err != nil {
 		log.Printf("메시지 조회 실패: %v", err)
 		return nil
@@ -136,7 +136,7 @@ func (cs *ChatServer) Messages() []Message {
 // Close는 ChatServer의 리소스를 정리합니다 (예: 데이터베이스 연결 닫기).
 func (cs *ChatServer) Close() error {
 	log.Println("ChatServer 리소스 정리 중...")
-	return cs.store.Close()
+	return cs.Store.Close()
 }
 
 func (cs *ChatServer) ClientCount() int {

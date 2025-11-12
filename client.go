@@ -100,7 +100,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		var colors = []int{
 			31, 32, 33, 34, 35, 36,
 		}
-		client := chat.NewClient(globalChat, banManager, s, finalNickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), colors[rand.Intn(len(colors))], ip)
+		client := chat.NewClient(globalChat, banManager, globalChat.Store, s, finalNickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), colors[rand.Intn(len(colors))], ip)
 		globalChat.AddClient(client)
 		defer func() {
 			globalChat.RemoveClient(client)

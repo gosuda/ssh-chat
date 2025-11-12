@@ -3,6 +3,7 @@ package chat
 import (
 	"bufio"
 	"context"
+	"database/sql" // Add this line
 	"errors"
 	"fmt"
 	"log"
@@ -19,6 +20,7 @@ type Client struct {
 	session    ssh.Session
 	server     *ChatServer
 	banManager *BanManager
+	store      MessageStore // Add this line
 
 	mu                sync.Mutex
 	width             int
@@ -36,23 +38,45 @@ type Client struct {
 	ip        string
 }
 
-func NewClient(server *ChatServer, banManager *BanManager, session ssh.Session, nickname string, width, height, color int, ip string) *Client {
+func NewClient(server *ChatServer, banManager *BanManager, store MessageStore, session ssh.Session, nickname string, width, height, color int, ip string) *Client {
 	if width <= 0 || width > 8192 {
 		width = 80
 	}
 	if height <= 0 || height > 8192 {
 		height = 24
 	}
+
+	// Load user color from store, or create if new
+	userColor, err := store.GetUserColor(nickname)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// New user, create with default color
+			userColor = 37 // Default to white
+			if err := store.CreateUser(nickname, userColor); err != nil {
+				log.Printf("Failed to create new user %s in DB: %v", nickname, err)
+			}
+		} else {
+			log.Printf("Failed to get user color for %s from DB: %v. Using default color.", nickname, err)
+			userColor = 37 // Fallback to default color on error
+		}
+	}
+	// If the color passed in is not 0, it means it was explicitly set (e.g., by a command line arg),
+	// so we should prioritize that over the stored color.
+	if color != 0 {
+		userColor = color
+	}
+
 	return &Client{
 		session:           session,
 		server:            server,
 		banManager:        banManager,
+		store:             store,
 		width:             width,
 		height:            height,
 		updateCh:          make(chan struct{}, 16),
 		done:              make(chan struct{}),
 		nickname:          nickname,
-		color:             color,
+		color:             userColor, // Use the loaded/default color
 		inputBuffer:       make([]rune, 0, 128),
 		messageTimestamps: make([]time.Time, 0),
 		ip:                ip,
@@ -166,11 +190,6 @@ func (c *Client) render() {
 	// 전체 메시지를 역순으로 순회합니다.
 	for i := len(allMessages) - 1; i >= 0; i-- {
 		msg := allMessages[i]
-		// 색 변경을 여기서 파싱합니다.
-		if strings.Contains(msg.Text, "@색") {
-			color := strings.Split(msg.Text, " ")[1]
-			changeColor(color, &msg);
-		}
 		// 메시지 하나를 포맷팅하여 라인들로 변환합니다.
 		msgLines := formatMessage(msg, width)
 
@@ -335,6 +354,14 @@ func (c *Client) handleEnter() {
 		disconnected := c.server.DisconnectByIP(target)
 		c.server.AppendSystemMessage(fmt.Sprintf("IP %s banned. Disconnected %d session(s).", target, disconnected))
 		return
+	} else if strings.HasPrefix(text, "@색 ") { // Check for @색 command
+		parts := strings.SplitN(text, " ", 2)
+		if len(parts) == 2 {
+			c.handleColorCommand(parts[1])
+		} else {
+			c.server.AppendSystemMessage("사용법: @색 [색상명]")
+		}
+		return // Important: return after handling the command
 	}
 
 	c.server.AppendMessage(Message{
@@ -420,23 +447,39 @@ func isControlRune(r rune) bool {
 	return r < 32 || r == 127
 }
 
-func changeColor(color string, msg *Message) {
-	if color == "빨강" || strings.Contains(color, "빨") {
-		msg.Color = 31
-	} else if color == "녹색" || strings.Contains(color, "초") {
-		msg.Color = 32
-	// 터미널의 어두운 노란색은 갈색처럼 표시되니까 이렇게 둘을 넣어줍니다.
-	} else if strings.Contains(color, "노") || strings.Contains(color, "갈") {
-		msg.Color = 33
-	} else if strings.Contains(color, "파") {
-		msg.Color = 34
-	// 환경에 따라 마젠타가 자주색이거나 분홍색이니 마찬가지로 처리합니다.
-	} else if strings.Contains(color, "자") || strings.Contains(color, "분") {
-		msg.Color = 35
-	// 대체로 이것은 하늘색이지만 ANSI에서는 청록이라고 정의합니다.
-	} else if strings.Contains(color, "하늘") || strings.Contains(color, "청록") {
-		msg.Color = 36
+// handleColorCommand processes the @색 command, updates the client's color, and persists it.
+func (c *Client) handleColorCommand(colorName string) {
+	newColor := 37 // Default to white
+
+	// Determine the ANSI color code based on colorName
+	if colorName == "빨강" || strings.Contains(colorName, "빨") {
+		newColor = 31
+	} else if colorName == "녹색" || strings.Contains(colorName, "초") {
+		newColor = 32
+	} else if strings.Contains(colorName, "노") || strings.Contains(colorName, "갈") {
+		newColor = 33
+	} else if strings.Contains(colorName, "파") {
+		newColor = 34
+	} else if strings.Contains(colorName, "자") || strings.Contains(colorName, "분") {
+		newColor = 35
+	} else if strings.Contains(colorName, "하늘") || strings.Contains(colorName, "청록") {
+		newColor = 36
 	}
+
+	// Update client's current color
+	c.mu.Lock()
+	c.color = newColor
+	c.mu.Unlock()
+
+	// Persist the new color to the database
+	if err := c.store.SetUserColor(c.nickname, newColor); err != nil {
+		log.Printf("Failed to persist color for user %s: %v", c.nickname, err)
+		c.server.AppendSystemMessage(fmt.Sprintf("Failed to save your color preference, %s.", c.nickname))
+		return
+	}
+
+	c.server.AppendSystemMessage(fmt.Sprintf("%s님의 색상이 변경되었습니다.", c.nickname))
+	c.Notify()
 }
 
 // [HELPER] O(n) 로직을 분리하기 위해, 메시지 '하나'만 포맷하는 헬퍼 함수를 만들었습니다.

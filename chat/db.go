@@ -16,6 +16,9 @@ type MessageStore interface {
 	AppendMessage(msg Message) error
 	GetMessages(offset, limit int) ([]Message, error)
 	Close() error
+	GetUserColor(nick string) (int, error)
+	SetUserColor(nick string, color int) error
+	CreateUser(nick string, color int) error
 }
 
 // SQLiteMessageStore는 SQLite를 사용하여 메시지를 저장합니다.
@@ -48,7 +51,17 @@ func (s *SQLiteMessageStore) Init() error {
 	if err != nil {
 		return fmt.Errorf("메시지 테이블 생성 실패: %w", err)
 	}
-	log.Println("SQLite 메시지 테이블 초기화 완료.")
+
+	createUserTableSQL := `
+	CREATE TABLE IF NOT EXISTS users (
+		nick TEXT PRIMARY KEY,
+		color INTEGER NOT NULL
+	);`
+	_, err = s.db.Exec(createUserTableSQL)
+	if err != nil {
+		return fmt.Errorf("사용자 테이블 생성 실패: %w", err)
+	}
+	log.Println("SQLite 메시지 및 사용자 테이블 초기화 완료.")
 	return nil
 }
 
@@ -134,6 +147,37 @@ func (s *SQLiteMessageStore) GetMessages(offset, limit int) ([]Message, error) {
 // Close는 데이터베이스 연결을 닫습니다.
 func (s *SQLiteMessageStore) Close() error {
 	return s.db.Close()
+}
+
+// GetUserColor는 사용자의 색상을 조회합니다.
+func (s *SQLiteMessageStore) GetUserColor(nick string) (int, error) {
+	var color int
+	err := s.db.QueryRow("SELECT color FROM users WHERE nick = ?", nick).Scan(&color)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil // 사용자가 없으면 0 (기본값) 반환
+		}
+		return 0, fmt.Errorf("사용자 색상 조회 실패: %w", err)
+	}
+	return color, nil
+}
+
+// SetUserColor는 사용자의 색상을 업데이트합니다.
+func (s *SQLiteMessageStore) SetUserColor(nick string, color int) error {
+	_, err := s.db.Exec("UPDATE users SET color = ? WHERE nick = ?", color, nick)
+	if err != nil {
+		return fmt.Errorf("사용자 색상 업데이트 실패: %w", err)
+	}
+	return nil
+}
+
+// CreateUser는 새로운 사용자를 추가합니다.
+func (s *SQLiteMessageStore) CreateUser(nick string, color int) error {
+	_, err := s.db.Exec("INSERT INTO users(nick, color) VALUES(?, ?)", nick, color)
+	if err != nil {
+		return fmt.Errorf("사용자 생성 실패: %w", err)
+	}
+	return nil
 }
 
 // splitMentions는 쉼표로 구분된 멘션 문자열을 슬라이스로 분리합니다.
