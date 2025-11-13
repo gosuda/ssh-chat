@@ -229,7 +229,7 @@ func (c *Client) render() {
 	// 화면에 표시할 최종 라인들을 선택합니다.
 	displayLines := relevantLines[start:end]
 
-	status := fmt.Sprintf("Users:%d Messages:%d Scroll:%d/%d ↑/↓ to scroll", c.server.ClientCount(), len(allMessages), scroll, maxOffset)
+	status := fmt.Sprintf("Users:%d Messages:%d Scroll:%d/%d ↑/↓, PgUp/PgDn to scroll", c.server.ClientCount(), len(allMessages), scroll, maxOffset)
 	status = fitString(status, width)
 
 	inputText := string(inputCopy)
@@ -437,6 +437,27 @@ func (c *Client) handleEscape(reader *bufio.Reader) {
 		c.mu.Lock()
 		if c.scrollOffset > 0 {
 			c.scrollOffset--
+		}
+		c.mu.Unlock()
+		c.Notify()
+	case '5': // PgUp
+		b3, err := reader.ReadByte()
+		if err != nil || b3 != '~' {
+			return
+		}
+		c.mu.Lock()
+		c.scrollOffset += 100
+		c.mu.Unlock()
+		c.Notify()
+	case '6': // PgDown
+		b3, err := reader.ReadByte()
+		if err != nil || b3 != '~' {
+			return
+		}
+		c.mu.Lock()
+		c.scrollOffset -= 100
+		if c.scrollOffset < 0 {
+			c.scrollOffset = 0
 		}
 		c.mu.Unlock()
 		c.Notify()
