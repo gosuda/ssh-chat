@@ -160,8 +160,6 @@ func (c *Client) renderLoop() {
 }
 
 func (c *Client) render() {
-	allMessages := c.server.Messages()
-
 	c.mu.Lock()
 	width := c.width
 	height := c.height
@@ -179,6 +177,32 @@ func (c *Client) render() {
 	messageArea := height - 2
 	if messageArea < 1 {
 		messageArea = 1
+	}
+
+	totalMessages, err := c.store.GetMessageCount()
+	if err != nil {
+		log.Printf("Failed to get message count: %v", err)
+		totalMessages = 0 // fallback
+	}
+
+	// Estimate message offset from line-based scroll offset.
+	// Heuristic: assume 1.5 lines per message on average.
+	estimatedMsgOffset := scroll * 2 / 3
+	fetchLimit := 500 // Fetch a window of 500 messages
+
+	if estimatedMsgOffset < 0 {
+		estimatedMsgOffset = 0
+	}
+	// The offset for GetMessages is from the most recent message.
+	// Ensure we don't offset past the beginning of history.
+	if estimatedMsgOffset > totalMessages {
+		estimatedMsgOffset = totalMessages
+	}
+
+	allMessages, err := c.store.GetMessages(estimatedMsgOffset, fetchLimit)
+	if err != nil {
+		log.Printf("Failed to get messages: %v", err)
+		allMessages = []Message{} // fallback
 	}
 
 	// [OPTIMIZATION]
@@ -227,9 +251,12 @@ func (c *Client) render() {
 	}
 
 	// 화면에 표시할 최종 라인들을 선택합니다.
-	displayLines := relevantLines[start:end]
+	var displayLines []string
+	if start < len(relevantLines) && end <= len(relevantLines) {
+		displayLines = relevantLines[start:end]
+	}
 
-	status := fmt.Sprintf("Users:%d Messages:%d Scroll:%d/%d ↑/↓, PgUp/PgDn to scroll", c.server.ClientCount(), len(allMessages), scroll, maxOffset)
+	status := fmt.Sprintf("Users:%d Messages:%d Scroll:%d/%d ↑/↓, PgUp/PgDn to scroll", c.server.ClientCount(), totalMessages, scroll, maxOffset)
 	status = fitString(status, width)
 
 	inputText := string(inputCopy)
@@ -446,7 +473,11 @@ func (c *Client) handleEscape(reader *bufio.Reader) {
 			return
 		}
 		c.mu.Lock()
-		c.scrollOffset += 100
+		pageSize := c.height - 2
+		if pageSize < 1 {
+			pageSize = 1
+		}
+		c.scrollOffset += pageSize
 		c.mu.Unlock()
 		c.Notify()
 	case '6': // PgDown
@@ -455,7 +486,11 @@ func (c *Client) handleEscape(reader *bufio.Reader) {
 			return
 		}
 		c.mu.Lock()
-		c.scrollOffset -= 100
+		pageSize := c.height - 2
+		if pageSize < 1 {
+			pageSize = 1
+		}
+		c.scrollOffset -= pageSize
 		if c.scrollOffset < 0 {
 			c.scrollOffset = 0
 		}

@@ -124,8 +124,8 @@ func (cs *ChatServer) DisconnectByIP(ip string) int {
 }
 
 func (cs *ChatServer) Messages() []Message {
-	// 최신 100개의 메시지를 데이터베이스에서 조회
-	messages, err := cs.Store.GetMessages(0, 100)
+	// 최신 1000개의 메시지를 데이터베이스에서 조회
+	messages, err := cs.Store.GetMessages(0, 1000)
 	if err != nil {
 		log.Printf("메시지 조회 실패: %v", err)
 		return nil

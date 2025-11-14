@@ -15,6 +15,7 @@ type MessageStore interface {
 	Init() error
 	AppendMessage(msg Message) error
 	GetMessages(offset, limit int) ([]Message, error)
+	GetMessageCount() (int, error)
 	Close() error
 	GetUserColor(nick string) (int, error)
 	SetUserColor(nick string, color int) error
@@ -142,6 +143,16 @@ func (s *SQLiteMessageStore) GetMessages(offset, limit int) ([]Message, error) {
 	}
 
 	return messages, nil
+}
+
+// GetMessageCount는 총 메시지 개수를 반환합니다.
+func (s *SQLiteMessageStore) GetMessageCount() (int, error) {
+	var count int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("메시지 개수 조회 실패: %w", err)
+	}
+	return count, nil
 }
 
 // Close는 데이터베이스 연결을 닫습니다.
