@@ -51,7 +51,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	quitCh := make(chan os.Signal, 1)
 	signal.Notify(quitCh, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 
-	banManager := chat.NewBanManager()
+	banManager := chat.BanManager{banned: make(map[string]struct{})}
 	globalChat, err := chat.NewChatServer(dbPath) // dbPath 전달 및 에러 처리
 	if err != nil {
 		return fmt.Errorf("채팅 서버 초기화 실패: %w", err)
@@ -149,7 +149,7 @@ func startAndMonitorServer(
 				if r := recover(); r != nil {
 					err := fmt.Errorf("panic in ListenAndServe goroutine: %v", r)
 					log.Printf("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥: %v", err) // 패닉 알림
-					errCh <- err // 외부 루프에 패닉 발생 알림
+					errCh <- err                                // 외부 루프에 패닉 발생 알림
 				}
 			}()
 			log.Printf("starting ssh chat server on %s ...", addr)
@@ -165,9 +165,9 @@ func startAndMonitorServer(
 			_ = srv.Close() // 새 연결 막고 종료
 			return nil
 		case err := <-errCh:
-			log.Printf("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥: %v", err) // 서버 죽음 알림
+			log.Printf("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥: %v", err)            // 서버 죽음 알림
 			globalChat.AppendSystemMessage("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥") // 클라이언트에게도 알림
-			_ = srv.Close() // 현재 서버 인스턴스 종료
+			_ = srv.Close()                                        // 현재 서버 인스턴스 종료
 			// 루프의 다음 반복에서 새 서버 인스턴스가 생성됩니다.
 		}
 	}

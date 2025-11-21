@@ -325,6 +325,20 @@ func (c *Client) inputLoop(reader *bufio.Reader) {
 	}
 }
 
+func (c *Client) IsAdmin() bool {
+	switch c.nickname {
+	case "손희성":
+		fallthrough
+	case "ggoban":
+		fallthrough
+	case "kozeki":
+		fallthrough
+	case "yjlee":
+		return true
+	}
+	return false
+}
+
 func (c *Client) handleEnter() {
 	c.mu.Lock()
 	text := strings.TrimSpace(string(c.inputBuffer))
@@ -389,6 +403,25 @@ func (c *Client) handleEnter() {
 			c.server.AppendSystemMessage("사용법: @색 [색상명]")
 		}
 		return // Important: return after handling the command
+	} else if strings.HasPrefix(text, "/pardon ") && c.IsAdmin() {
+		parts := strings.Fields(strings.TrimPrefix(text, "/pardon "))
+		if len(parts) > 0 {
+			for _, ipToPardon := range parts {
+				c.banManager.Pardon(ipToPardon)
+				c.server.AppendSystemMessage(fmt.Sprintf("IP %s pardoned.", ipToPardon))
+			}
+		} else {
+			c.server.AppendSystemMessage("사용법: /pardon [IP 주소1] [IP 주소2]...")
+		}
+		return
+	} else if text == "/banlist" && c.IsAdmin() {
+		banlist := c.banManager.BanList()
+		if banlist == "" {
+			c.server.AppendSystemMessage("밴된 IP가 없습니다.")
+		} else {
+			c.server.AppendSystemMessage("현재 밴 리스트:\n" + banlist)
+		}
+		return
 	}
 
 	c.server.AppendMessage(Message{

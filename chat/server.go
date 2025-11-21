@@ -9,13 +9,14 @@ import (
 	"time"
 )
 
-	type ChatServer struct {
+type ChatServer struct {
 	mu        sync.RWMutex
 	Store     MessageStore // 메시지 저장소 인터페이스
 	clients   map[*Client]struct{}
 	ipCounts  map[string]int  // IP당 연결 수 추적
 	nicknames map[string]bool // 사용 중인 닉네임 추적
 }
+
 func NewChatServer(dbPath string) (*ChatServer, error) {
 	store, err := NewSQLiteMessageStore(dbPath)
 	if err != nil {
