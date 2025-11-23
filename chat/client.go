@@ -3,7 +3,7 @@ package chat
 import (
 	"bufio"
 	"context"
-	"database/sql" // Add this line
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -20,7 +20,7 @@ type Client struct {
 	session    ssh.Session
 	server     *ChatServer
 	banManager *BanManager
-	store      MessageStore // Add this line
+	store      MessageStore
 
 	mu                sync.Mutex
 	width             int
@@ -46,12 +46,10 @@ func NewClient(server *ChatServer, banManager *BanManager, store MessageStore, s
 		height = 24
 	}
 
-	// Load user color from store, or create if new
 	userColor, err := store.GetUserColor(nickname)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// New user, create with default color
-			userColor = 37 // Default to white
+			userColor = 37 
 			if err := store.CreateUser(nickname, userColor); err != nil {
 				log.Printf("Failed to create new user %s in DB: %v", nickname, err)
 			}
@@ -60,8 +58,6 @@ func NewClient(server *ChatServer, banManager *BanManager, store MessageStore, s
 			userColor = 37 // Fallback to default color on error
 		}
 	}
-	// If the color passed in is not 0, it means it was explicitly set (e.g., by a command line arg),
-	// so we should prioritize that over the stored color.
 	if color != 0 {
 		userColor = color
 	}
@@ -120,10 +116,8 @@ func (c *Client) Notify() {
 	}
 }
 
-// NotifyWithBell sends a notification with optional bell character
 func (c *Client) NotifyWithBell(withBell bool) {
 	if withBell {
-		// Send bell character before the update notification
 		c.session.Write([]byte("\a"))
 	}
 	c.Notify()
@@ -184,17 +178,16 @@ func (c *Client) render() {
 		log.Printf("Failed to get message count: %v", err)
 		totalMessages = 0 // fallback
 	}
-
-	// Fetch a window of 100 messages around the scroll offset.
+    // [OPTIMIZATION]
+	// 스크롤 오프셋에 맞게 100개의 메시지로 제한합니다.
 	fetchLimit := 100
-	// Heuristic: assume 1.5 lines per message on average.
+	// 휴리스틱: 넉넉잡아 메시지 1개를 1.5줄로 합니다.
 	messageOffset := scroll * 2 / 3
 
 	if messageOffset < 0 {
 		messageOffset = 0
 	}
-	// The offset for GetMessages is from the most recent message.
-	// Ensure we don't offset past the beginning of history.
+	// GetMessages의 오프셋은 가장 최근 메시지로부터 옵니다.
 	if messageOffset > totalMessages {
 		messageOffset = totalMessages
 	}
