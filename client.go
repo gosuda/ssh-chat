@@ -61,7 +61,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		store = s
 	} else {
-		store = chat.NewNullMessageStore()
+		store = chat.NewMemoryMessageStore()
 	}
 
 	globalChat, err := chat.NewChatServer(store) // dbPath 전달 및 에러 처리
