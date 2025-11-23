@@ -1,5 +1,10 @@
 package types
-import "sync"
+
+import (
+	"sync"
+	"time"
+)
+
 // ConnectionRateLimiter tracks connection attempts per IP.
 type ConnectionRateLimiter struct {
 	mu      sync.Mutex

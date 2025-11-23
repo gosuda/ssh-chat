@@ -185,21 +185,21 @@ func (c *Client) render() {
 		totalMessages = 0 // fallback
 	}
 
-	// Estimate message offset from line-based scroll offset.
+	// Fetch a window of 100 messages around the scroll offset.
+	fetchLimit := 100
 	// Heuristic: assume 1.5 lines per message on average.
-	estimatedMsgOffset := scroll * 2 / 3
-	fetchLimit := 500 // Fetch a window of 500 messages
+	messageOffset := scroll * 2 / 3
 
-	if estimatedMsgOffset < 0 {
-		estimatedMsgOffset = 0
+	if messageOffset < 0 {
+		messageOffset = 0
 	}
 	// The offset for GetMessages is from the most recent message.
 	// Ensure we don't offset past the beginning of history.
-	if estimatedMsgOffset > totalMessages {
-		estimatedMsgOffset = totalMessages
+	if messageOffset > totalMessages {
+		messageOffset = totalMessages
 	}
 
-	allMessages, err := c.store.GetMessages(estimatedMsgOffset, fetchLimit)
+	allMessages, err := c.store.GetMessages(messageOffset, fetchLimit)
 	if err != nil {
 		log.Printf("Failed to get messages: %v", err)
 		allMessages = []Message{} // fallback
@@ -375,7 +375,11 @@ func (c *Client) handleEnter() {
 
 	if messageCount > 30 {
 		log.Printf("Kicking client %s (%s) for spamming.", c.nickname, c.ip)
-		c.banManager.Ban(c.ip)
+		err := c.banManager.Ban(c.ip, "server", "spamming")
+		if err != nil {
+			c.server.AppendSystemMessage(fmt.Sprintf("Failed to ban IP: %v", err))
+			return
+		}
 		msg := fmt.Sprintf("야 `%s` 나가.", c.nickname)
 		c.server.AppendSystemMessage(msg)
 		c.session.Exit(1)
@@ -384,14 +388,23 @@ func (c *Client) handleEnter() {
 	}
 
 	// Commands
-	if strings.HasPrefix(text, "/ban ") {
-		target := strings.TrimSpace(strings.TrimPrefix(text, "/ban "))
-		// Allow just IP (IPv4/IPv6). No CIDR support for simplicity.
+	if strings.HasPrefix(text, "/ban ") && c.IsAdmin() {
+		parts := strings.Fields(strings.TrimPrefix(text, "/ban "))
+		if len(parts) < 2 {
+			c.server.AppendSystemMessage("사용법: /ban [IP 주소] [사유]")
+			return
+		}
+		target := parts[0]
+		reason := strings.Join(parts[1:], " ")
 		if ip := net.ParseIP(target); ip == nil {
 			c.server.AppendSystemMessage("Invalid IP address")
 			return
 		}
-		c.banManager.Ban(target)
+		err := c.banManager.Ban(target, c.nickname, reason)
+		if err != nil {
+			c.server.AppendSystemMessage(fmt.Sprintf("Failed to ban IP: %v", err))
+			return
+		}
 		disconnected := c.server.DisconnectByIP(target)
 		c.server.AppendSystemMessage(fmt.Sprintf("IP %s banned. Disconnected %d session(s).", target, disconnected))
 		return
@@ -407,7 +420,11 @@ func (c *Client) handleEnter() {
 		parts := strings.Fields(strings.TrimPrefix(text, "/pardon "))
 		if len(parts) > 0 {
 			for _, ipToPardon := range parts {
-				c.banManager.Pardon(ipToPardon)
+				err := c.banManager.Pardon(ipToPardon)
+				if err != nil {
+					c.server.AppendSystemMessage(fmt.Sprintf("Failed to pardon IP %s: %v", ipToPardon, err))
+					continue
+				}
 				c.server.AppendSystemMessage(fmt.Sprintf("IP %s pardoned.", ipToPardon))
 			}
 		} else {
@@ -582,8 +599,8 @@ func formatMessage(msg Message, width int) []string {
 	// Highlight mentions in the message text
 	highlightedText := highlightMentions(msg.Text, msg.Mentions)
 
-	prefix := fmt.Sprintf("[%s] %s: ", msg.Time.Format("15:04:05"), coloredNick)
-	indent := strings.Repeat(" ", len(msg.Nick)+13)
+  prefix := fmt.Sprintf("[%s] %s: ", msg.Time.Format("15:04:05"), coloredNick)
+  indent := strings.Repeat(" ", len(msg.Nick)+13)
 
 	var lines []string
 	segments := strings.Split(highlightedText, "\n")

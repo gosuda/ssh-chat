@@ -12,23 +12,27 @@ import (
 type ChatServer struct {
 	mu        sync.RWMutex
 	Store     MessageStore // 메시지 저장소 인터페이스
+	Bans      *BanManager
 	clients   map[*Client]struct{}
 	ipCounts  map[string]int  // IP당 연결 수 추적
 	nicknames map[string]bool // 사용 중인 닉네임 추적
 }
 
-func NewChatServer(dbPath string) (*ChatServer, error) {
-	store, err := NewSQLiteMessageStore(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("SQLite 메시지 저장소 생성 실패: %w", err)
-	}
-
+func NewChatServer(store MessageStore) (*ChatServer, error) {
 	if err := store.Init(); err != nil {
 		return nil, fmt.Errorf("메시지 저장소 초기화 실패: %w", err)
 	}
 
+	bans := NewBanManager(store)
+	banList, err := store.GetBans()
+	if err != nil {
+		return nil, fmt.Errorf("밴 목록 로드 실패: %w", err)
+	}
+	bans.LoadBans(banList)
+
 	cs := &ChatServer{
 		Store:     store,
+		Bans:      bans,
 		clients:   make(map[*Client]struct{}),
 		ipCounts:  make(map[string]int),
 		nicknames: make(map[string]bool),
@@ -125,8 +129,8 @@ func (cs *ChatServer) DisconnectByIP(ip string) int {
 }
 
 func (cs *ChatServer) Messages() []Message {
-	// 최신 1000개의 메시지를 데이터베이스에서 조회
-	messages, err := cs.Store.GetMessages(0, 1000)
+	// 최신 100개의 메시지를 데이터베이스에서 조회
+	messages, err := cs.Store.GetMessages(0, 100)
 	if err != nil {
 		log.Printf("메시지 조회 실패: %v", err)
 		return nil

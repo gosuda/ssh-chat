@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/iwanhae/ssh-chat/types"
 	_ "github.com/mattn/go-sqlite3" // SQLite 드라이버
 )
 
@@ -20,6 +21,9 @@ type MessageStore interface {
 	GetUserColor(nick string) (int, error)
 	SetUserColor(nick string, color int) error
 	CreateUser(nick string, color int) error
+	GetBans() ([]*types.Ban, error)
+	SaveBan(*types.Ban) error
+	RemoveBan(*types.Ban) error
 }
 
 // SQLiteMessageStore는 SQLite를 사용하여 메시지를 저장합니다.
@@ -62,12 +66,30 @@ func (s *SQLiteMessageStore) Init() error {
 	if err != nil {
 		return fmt.Errorf("사용자 테이블 생성 실패: %w", err)
 	}
-	log.Println("SQLite 메시지 및 사용자 테이블 초기화 완료.")
+
+	createBansTableSQL := `
+	CREATE TABLE IF NOT EXISTS bans (
+		ip TEXT PRIMARY KEY,
+		banned_by TEXT NOT NULL,
+		reason TEXT NOT NULL,
+		timestamp DATETIME NOT NULL
+	);`
+	_, err = s.db.Exec(createBansTableSQL)
+	if err != nil {
+		return fmt.Errorf("밴 테이블 생성 실패: %w", err)
+	}
+
+	log.Println("SQLite 메시지, 사용자 및 밴 테이블 초기화 완료.")
 	return nil
 }
 
-// AppendMessage는 메시지를 데이터베이스에 추가합니다.
+// AppendMessage는 메시지를 데이터베이스에 추가하고, 메시지 수가 4000개를 초과하면 가장 오래된 메시지를 삭제합니다.
 func (s *SQLiteMessageStore) AppendMessage(msg Message) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("트랜잭션 시작 실패: %w", err)
+	}
+
 	mentions := ""
 	if len(msg.Mentions) > 0 {
 		for i, m := range msg.Mentions {
@@ -79,11 +101,29 @@ func (s *SQLiteMessageStore) AppendMessage(msg Message) error {
 	}
 
 	insertSQL := `INSERT INTO messages(timestamp, nick, text, color, ip, mentions) VALUES(?, ?, ?, ?, ?, ?)`
-	_, err := s.db.Exec(insertSQL, msg.Time, msg.Nick, msg.Text, msg.Color, msg.IP, mentions)
+	_, err = tx.Exec(insertSQL, msg.Time, msg.Nick, msg.Text, msg.Color, msg.IP, mentions)
 	if err != nil {
+		tx.Rollback()
 		return fmt.Errorf("메시지 데이터베이스 저장 실패: %w", err)
 	}
-	return nil
+
+	var count int
+	err = tx.QueryRow("SELECT COUNT(*) FROM messages").Scan(&count)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("메시지 개수 조회 실패: %w", err)
+	}
+
+	if count > 4000 {
+		deleteSQL := `DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY id ASC LIMIT ?)`
+		_, err = tx.Exec(deleteSQL, count-4000)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("오래된 메시지 삭제 실패: %w", err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 // GetMessages는 지정된 offset과 limit에 따라 메시지를 조회합니다.
@@ -143,6 +183,58 @@ func (s *SQLiteMessageStore) GetMessages(offset, limit int) ([]Message, error) {
 	}
 
 	return messages, nil
+}
+
+// GetBans는 데이터베이스에서 모든 밴 목록을 조회합니다.
+func (s *SQLiteMessageStore) GetBans() ([]*types.Ban, error) {
+	query := `SELECT ip, banned_by, reason, timestamp FROM bans`
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("밴 목록 조회 실패: %w", err)
+	}
+	defer rows.Close()
+
+	var bans []*types.Ban
+	for rows.Next() {
+		var ban types.Ban
+		var timestampStr string
+		err := rows.Scan(&ban.IP, &ban.BannedBy, &ban.Reason, &timestampStr)
+		if err != nil {
+			return nil, fmt.Errorf("밴 정보 스캔 실패: %w", err)
+		}
+
+		parsedTime, err := time.Parse(time.RFC3339, timestampStr)
+		if err != nil {
+			log.Printf("경고: 밴 타임스탬프 파싱 실패 (%s): %v", timestampStr, err)
+		}
+		ban.At = parsedTime
+		bans = append(bans, &ban)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("밴 목록 행 반복 중 오류: %w", err)
+	}
+	return bans, nil
+}
+
+// SaveBan은 밴 정보를 데이터베이스에 저장합니다.
+func (s *SQLiteMessageStore) SaveBan(ban *types.Ban) error {
+	insertSQL := `INSERT OR REPLACE INTO bans(ip, banned_by, reason, timestamp) VALUES(?, ?, ?, ?)`
+	_, err := s.db.Exec(insertSQL, ban.IP, ban.BannedBy, ban.Reason, ban.At)
+	if err != nil {
+		return fmt.Errorf("밴 정보 데이터베이스 저장 실패: %w", err)
+	}
+	return nil
+}
+
+// RemoveBan은 데이터베이스에서 밴 정보를 삭제합니다.
+func (s *SQLiteMessageStore) RemoveBan(ban *types.Ban) error {
+	deleteSQL := `DELETE FROM bans WHERE ip = ?`
+	_, err := s.db.Exec(deleteSQL, ban.IP)
+	if err != nil {
+		return fmt.Errorf("밴 정보 데이터베이스 삭제 실패: %w", err)
+	}
+	return nil
 }
 
 // GetMessageCount는 총 메시지 개수를 반환합니다.
