@@ -41,6 +41,7 @@ func main() {
 	rootCmd.Flags().IntVar(&maxPerIP, "max-per-ip", 2, "max simultaneous connections allowed per IP")
 	rootCmd.Flags().DurationVar(&shutdownCountdown, "shutdown-countdown", 5*time.Second, "graceful shutdown countdown duration")
 	rootCmd.Flags().StringVar(&dbPath, "db-path", "chat.db", "path to SQLite database file") // dbPath 플래그 추가
+	rootCmd.Flags().Bool("sqlite", false, "enable SQLite message store")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -51,8 +52,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 	quitCh := make(chan os.Signal, 1)
 	signal.Notify(quitCh, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 
-	banManager := chat.BanManager{banned: make(map[string]struct{})}
-	globalChat, err := chat.NewChatServer(dbPath) // dbPath 전달 및 에러 처리
+	var store chat.MessageStore
+	useSqlite, _ := cmd.Flags().GetBool("sqlite")
+	if useSqlite {
+		s, err := chat.NewSQLiteMessageStore(dbPath)
+		if err != nil {
+			return fmt.Errorf("failed to create sqlite store: %w", err)
+		}
+		store = s
+	} else {
+		store = chat.NewMemoryMessageStore()
+	}
+
+	globalChat, err := chat.NewChatServer(store) // dbPath 전달 및 에러 처리
 	if err != nil {
 		return fmt.Errorf("채팅 서버 초기화 실패: %w", err)
 	}
@@ -75,7 +87,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			ip = host
 		}
 
-		if banManager.IsBanned(ip) {
+		if globalChat.Bans.IsBanned(ip) {
 			fmt.Fprintln(s, "Your IP is banned.")
 			_ = s.Exit(1)
 			return
@@ -100,7 +112,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		var colors = []int{
 			31, 32, 33, 34, 35, 36,
 		}
-		client := chat.NewClient(globalChat, banManager, globalChat.Store, s, finalNickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), colors[rand.Intn(len(colors))], ip)
+		client := chat.NewClient(globalChat, globalChat.Bans, globalChat.Store, s, finalNickname, int(ptyReq.Window.Width), int(ptyReq.Window.Height), colors[rand.Intn(len(colors))], ip)
 		globalChat.AddClient(client)
 		defer func() {
 			globalChat.RemoveClient(client)
