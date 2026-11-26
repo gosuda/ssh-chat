@@ -212,6 +212,11 @@ func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) err
 // Each RPC owns its reply map. Prompt IDs select replies within that RPC;
 // generated storage IDs keep prompts and independent assistants distinct.
 func (s *gRPCServer) handleResponse(message *pb.AIResponse, replies map[string]replyState) error {
+	switch message.Format {
+	case pb.ResponseFormat_SNAPSHOT, pb.ResponseFormat_DELTA:
+	default:
+		return status.Error(codes.InvalidArgument, "unknown response format")
+	}
 	if message.MessageId == "" {
 		return nil
 	}
@@ -222,14 +227,19 @@ func (s *gRPCServer) handleResponse(message *pb.AIResponse, replies map[string]r
 		}
 		return nil
 	}
-	if !exists && len(replies) >= 100 {
+	if !exists && !message.IsFinal && len(replies) >= 100 {
 		return status.Error(codes.ResourceExhausted, "too many unfinished replies")
 	}
-	chunk := sanitizeReplyText(message.Text)
-	if len(reply.text)+len(chunk) > 64*1024 {
+	text := sanitizeReplyText(message.Text)
+	if message.Format == pb.ResponseFormat_DELTA {
+		if len(reply.text)+len(text) > 64*1024 {
+			return status.Error(codes.ResourceExhausted, "reply exceeds 64 KiB")
+		}
+		text = reply.text + text
+	}
+	if len(text) > 64*1024 {
 		return status.Error(codes.ResourceExhausted, "reply exceeds 64 KiB")
 	}
-	text := reply.text + chunk
 	if exists {
 		updated, err := s.chatServer.UpdateMessage(reply.id, text)
 		if err != nil {
@@ -264,13 +274,11 @@ func sanitizeReplyText(raw string) string {
 	var text strings.Builder
 	text.Grow(len(raw))
 	for _, r := range raw {
-		switch r {
-		case '\r', '\n', '\t':
+		switch {
+		case unicode.IsGraphic(r) || r == '\u200c' || r == '\u200d':
+			text.WriteRune(r)
+		case unicode.IsSpace(r):
 			text.WriteByte(' ')
-		default:
-			if unicode.IsPrint(r) {
-				text.WriteRune(r)
-			}
 		}
 	}
 	return text.String()

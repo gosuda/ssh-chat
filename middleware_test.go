@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -121,7 +122,7 @@ func TestBidirectionalMessagesSurviveTheStorageRefactor(t *testing.T) {
 			if first.MessageId == "" || first.Nick != "reader" || first.Text != "question" || first.Ip != "192.0.2.1" {
 				t.Fatalf("incorrect outbound message: %v", first)
 			}
-			if err := stream.Send(&pb.AIResponse{MessageId: first.MessageId, Nick: "Assistant", Text: "part\x1b"}); err != nil {
+			if err := stream.Send(&pb.AIResponse{MessageId: first.MessageId, Nick: "Assistant", Text: "part\x1b", Format: pb.ResponseFormat_DELTA}); err != nil {
 				t.Fatal(err)
 			}
 			replyID := ""
@@ -134,7 +135,7 @@ func TestBidirectionalMessagesSurviveTheStorageRefactor(t *testing.T) {
 				}
 				return false
 			})
-			if err := stream.Send(&pb.AIResponse{MessageId: first.MessageId, Text: " complete\nanswer\u009b", IsFinal: true}); err != nil {
+			if err := stream.Send(&pb.AIResponse{MessageId: first.MessageId, Text: " complete\nanswer\u009b", IsFinal: true, Format: pb.ResponseFormat_DELTA}); err != nil {
 				t.Fatal(err)
 			}
 			await(t, func() bool {
@@ -506,10 +507,10 @@ func TestPromptIDsNeverBecomeReplyStorageIDs(t *testing.T) {
 			}
 			service := &gRPCServer{chatServer: core}
 			replies := make(map[string]replyState)
-			if err := service.handleResponse(&pb.AIResponse{MessageId: prompt.ID, Nick: "Assistant", Text: "first"}, replies); err != nil {
+			if err := service.handleResponse(&pb.AIResponse{MessageId: prompt.ID, Nick: "Assistant", Text: "first", Format: pb.ResponseFormat_DELTA}, replies); err != nil {
 				t.Fatalf("reply must have a separate storage ID: %v", err)
 			}
-			if err := service.handleResponse(&pb.AIResponse{MessageId: prompt.ID, Text: " second", IsFinal: true}, replies); err != nil {
+			if err := service.handleResponse(&pb.AIResponse{MessageId: prompt.ID, Text: " second", IsFinal: true, Format: pb.ResponseFormat_DELTA}, replies); err != nil {
 				t.Fatal(err)
 			}
 			prompts, responses := 0, 0
@@ -531,5 +532,132 @@ func TestPromptIDsNeverBecomeReplyStorageIDs(t *testing.T) {
 				t.Fatalf("reply lifecycle lost prompt or duplicated response: %d %d %d", prompts, responses, len(replies))
 			}
 		})
+	}
+}
+
+func TestReplyFormatsAndUnicodeSurviveStorage(t *testing.T) {
+	for _, kind := range []string{"memory", "sqlite"} {
+		t.Run(kind, func(t *testing.T) {
+			var store chat.MessageStore = chat.NewMemoryMessageStore()
+			if kind == "sqlite" {
+				var err error
+				store, err = chat.NewSQLiteMessageStore(filepath.Join(t.TempDir(), "chat.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			core, err := chat.NewChatServer(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := core.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			service := &gRPCServer{chatServer: core}
+			replies := make(map[string]replyState)
+			cases := []struct {
+				name   string
+				first  string
+				second string
+				format pb.ResponseFormat
+				want   string
+			}{
+				{name: "legacy", first: "par", second: "partial", want: "partial"},
+				{name: "delta", first: "par", second: "tial", format: pb.ResponseFormat_DELTA, want: "partial"},
+				{name: "unicode", first: "100\u00a0km \u0645\u06cc\u200c\u0631\u0648\u0645 ", second: "\U0001f469\u200d\U0001f52c\u2028safe\x1b\u009b\u202e", format: pb.ResponseFormat_DELTA, want: "100\u00a0km \u0645\u06cc\u200c\u0631\u0648\u0645 \U0001f469\u200d\U0001f52c safe"},
+			}
+			for _, example := range cases {
+				if err := service.handleResponse(&pb.AIResponse{MessageId: example.name, Nick: example.name, Text: example.first, Format: example.format}, replies); err != nil {
+					t.Fatal(err)
+				}
+				if err := service.handleResponse(&pb.AIResponse{MessageId: example.name, Text: example.second, Format: example.format, IsFinal: true}, replies); err != nil {
+					t.Fatal(err)
+				}
+				found := false
+				for _, message := range core.Messages() {
+					if message.Nick == example.name {
+						if found || message.Text != example.want {
+							t.Fatalf("reply format or Unicode text was altered: case=%s got=%q want=%q", example.name, message.Text, example.want)
+						}
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("reply %s was not stored", example.name)
+				}
+			}
+			count, err := store.GetMessageCount()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.handleResponse(&pb.AIResponse{MessageId: "invalid", Text: "ignored", Format: pb.ResponseFormat(99)}, replies); status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("unknown response format accepted: %v", err)
+			}
+			after, err := store.GetMessageCount()
+			if err != nil || after != count {
+				t.Fatalf("invalid format changed history: %d %d %v", count, after, err)
+			}
+		})
+	}
+}
+
+func TestFinalReplyDoesNotConsumeAnUnfinishedSlot(t *testing.T) {
+	core, err := chat.NewChatServer(chat.NewMemoryMessageStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := core.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	service := &gRPCServer{chatServer: core}
+	replies := make(map[string]replyState)
+	for index := 0; index < 100; index++ {
+		if err := service.handleResponse(&pb.AIResponse{MessageId: fmt.Sprintf("pending-%d", index), Text: "pending"}, replies); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := core.Store.GetMessageCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.handleResponse(&pb.AIResponse{MessageId: "finished", Text: "complete", IsFinal: true}, replies); err != nil {
+		t.Fatalf("final reply consumed an unfinished slot: %v", err)
+	}
+	after, err := core.Store.GetMessageCount()
+	if err != nil || after != before+1 {
+		t.Fatalf("final reply was not stored: before=%d after=%d err=%v", before, after, err)
+	}
+	if len(replies) != 100 {
+		t.Fatalf("pending count changed after final reply: %d", len(replies))
+	}
+	if err := service.handleResponse(&pb.AIResponse{MessageId: "overflow", Text: "pending"}, replies); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("unfinished reply bound was lost: %v", err)
+	}
+}
+
+func TestUnknownReplyFormatDoesNotFinalizeAnOpenReply(t *testing.T) {
+	core, err := chat.NewChatServer(chat.NewMemoryMessageStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := core.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	service := &gRPCServer{chatServer: core}
+	replies := make(map[string]replyState)
+	if err := service.handleResponse(&pb.AIResponse{MessageId: "open", Text: "pending"}, replies); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.handleResponse(&pb.AIResponse{MessageId: "open", IsFinal: true, Format: pb.ResponseFormat(99)}, replies); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("invalid format finalized an open reply: %v", err)
+	}
+	if len(replies) != 1 {
+		t.Fatal("invalid format discarded reply state")
 	}
 }
