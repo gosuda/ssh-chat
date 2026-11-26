@@ -224,8 +224,11 @@ func (s *gRPCServer) handleResponse(message *pb.AIResponse, replies map[string]r
 	if message.Text == "" {
 		if message.IsFinal {
 			delete(replies, message.MessageId)
+			return nil
 		}
-		return nil
+		if !exists || message.Format == pb.ResponseFormat_DELTA {
+			return nil
+		}
 	}
 	if !exists && !message.IsFinal && len(replies) >= 100 {
 		return status.Error(codes.ResourceExhausted, "too many unfinished replies")

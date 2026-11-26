@@ -588,6 +588,55 @@ func TestReplyFormatsAndUnicodeSurviveStorage(t *testing.T) {
 					t.Fatalf("reply %s was not stored", example.name)
 				}
 			}
+			storedText := func(id string) string {
+				t.Helper()
+				for _, message := range core.Messages() {
+					if message.ID == id {
+						return message.Text
+					}
+				}
+				t.Fatalf("reply %s is missing from storage", id)
+				return ""
+			}
+			for _, example := range []struct {
+				name       string
+				format     pb.ResponseFormat
+				final      bool
+				afterEmpty string
+				want       string
+			}{
+				{name: "empty-snapshot", afterEmpty: "", want: "Answer"},
+				{name: "empty-delta", format: pb.ResponseFormat_DELTA, afterEmpty: "Draft", want: "DraftAnswer"},
+				{name: "empty-final-marker", final: true, afterEmpty: "Draft", want: "Draft"},
+			} {
+				if err := service.handleResponse(&pb.AIResponse{MessageId: example.name, Text: "Draft"}, replies); err != nil {
+					t.Fatal(err)
+				}
+				reply, exists := replies[example.name]
+				if !exists {
+					t.Fatal("draft reply has no pending state")
+				}
+				if err := service.handleResponse(&pb.AIResponse{MessageId: example.name, Format: example.format, IsFinal: example.final}, replies); err != nil {
+					t.Fatal(err)
+				}
+				if got := storedText(reply.id); got != example.afterEmpty {
+					t.Fatalf("empty response did not update stored reply: case=%s got=%q want=%q", example.name, got, example.afterEmpty)
+				}
+				if !example.final {
+					if pending := replies[example.name]; pending.id != reply.id || pending.text != example.afterEmpty {
+						t.Fatalf("empty response did not update pending reply: case=%s pending=%+v", example.name, pending)
+					}
+					if err := service.handleResponse(&pb.AIResponse{MessageId: example.name, Text: "Answer", Format: pb.ResponseFormat_DELTA, IsFinal: true}, replies); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, exists := replies[example.name]; exists {
+					t.Fatalf("final response retained pending state: %s", example.name)
+				}
+				if got := storedText(reply.id); got != example.want {
+					t.Fatalf("empty response changed the final reply: case=%s got=%q want=%q", example.name, got, example.want)
+				}
+			}
 			count, err := store.GetMessageCount()
 			if err != nil {
 				t.Fatal(err)
