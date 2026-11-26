@@ -27,11 +27,19 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Make freshly installed Go plugins discoverable by protoc.
+set "PROTO_GOBIN="
+for /f "delims=" %%i in ('go env GOBIN') do set "PROTO_GOBIN=%%i"
+if not defined PROTO_GOBIN (
+  for /f "tokens=1 delims=;" %%i in ('go env GOPATH') do set "PROTO_GOBIN=%%i\bin"
+)
+set "PATH=%PROTO_GOBIN%;%PATH%"
+
 rem Check if protoc-gen-go is available
 where protoc-gen-go >nul 2>nul
 if errorlevel 1 (
   echo Error: protoc-gen-go not found. Installing...
-  go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.9
   if errorlevel 1 (
     echo Failed to install protoc-gen-go
     popd
@@ -43,7 +51,7 @@ rem Check if protoc-gen-go-grpc is available
 where protoc-gen-go-grpc >nul 2>nul
 if errorlevel 1 (
   echo Error: protoc-gen-go-grpc not found. Installing...
-  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
   if errorlevel 1 (
     echo Failed to install protoc-gen-go-grpc
     popd

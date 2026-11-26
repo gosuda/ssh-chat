@@ -22,10 +22,18 @@ if ! command -v protoc >/dev/null 2>&1; then
   exit 1
 fi
 
+# Go installs plugins in GOBIN, or the first GOPATH entry's bin directory.
+PROTO_GOBIN="$(go env GOBIN)"
+if [[ -z "${PROTO_GOBIN}" ]]; then
+  PROTO_GOPATH="$(go env GOPATH)"
+  PROTO_GOBIN="${PROTO_GOPATH%%:*}/bin"
+fi
+export PATH="${PROTO_GOBIN}:${PATH}"
+
 # Check if protoc-gen-go is available
 if ! command -v protoc-gen-go >/dev/null 2>&1; then
   echo "Error: protoc-gen-go not found. Installing..." >&2
-  go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.9
   if [[ $? -ne 0 ]]; then
     echo "Failed to install protoc-gen-go" >&2
     exit 1
@@ -35,7 +43,7 @@ fi
 # Check if protoc-gen-go-grpc is available
 if ! command -v protoc-gen-go-grpc >/dev/null 2>&1; then
   echo "Error: protoc-gen-go-grpc not found. Installing..." >&2
-  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
   if [[ $? -ne 0 ]]; then
     echo "Failed to install protoc-gen-go-grpc" >&2
     exit 1

@@ -14,8 +14,10 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/iwanhae/ssh-chat/chat"
 	pb "github.com/iwanhae/ssh-chat/proto"
@@ -47,35 +49,52 @@ func loadClientPublicKey(path string) (*ecdsa.PublicKey, error) {
 	return publicKey, nil
 }
 
+func authenticationDigest(ip string, timestamp int64) [32]byte {
+	message := make([]byte, len(ip)+8)
+	copy(message, ip)
+	binary.BigEndian.PutUint64(message[len(ip):], uint64(timestamp))
+	return sha256.Sum256(message)
+}
+
 func verifySignature(publicKey *ecdsa.PublicKey, ip string, timestamp int64, signature []byte) error {
 	now := time.Now().UnixMilli()
 	if timestamp < now-60_000 || timestamp > now+60_000 {
 		return errors.New("authentication timestamp is outside the one-minute window")
 	}
-	message := make([]byte, len(ip)+8)
-	copy(message, ip)
-	binary.BigEndian.PutUint64(message[len(ip):], uint64(timestamp))
-	digest := sha256.Sum256(message)
+	digest := authenticationDigest(ip, timestamp)
 	if !ecdsa.VerifyASN1(publicKey, digest[:], signature) {
 		return errors.New("authentication signature is invalid")
 	}
 	return nil
 }
 
+type middlewareStream struct {
+	messages chan *pb.ChatMessage
+	overflow chan struct{}
+}
+
+type replyState struct {
+	id   string
+	text string
+}
+
 type gRPCServer struct {
 	pb.UnimplementedStreamMiddlewareServer
-	chatServer     *chat.ChatServer
-	activeStreamMu sync.Mutex
-	activeStreams  map[string]chan *pb.ChatMessage
-	clientPubKey   *ecdsa.PublicKey
-	authEnabled    bool
+	chatServer          *chat.ChatServer
+	activeStreamMu      sync.Mutex
+	activeStreams       map[string]*middlewareStream
+	authMu              sync.Mutex
+	usedAuthentications map[[32]byte]int64
+	clientPubKey        *ecdsa.PublicKey
+	authEnabled         bool
 }
 
 func newGRPCServer(server *chat.ChatServer, authEnabled bool) (*gRPCServer, error) {
 	service := &gRPCServer{
-		chatServer:    server,
-		activeStreams: make(map[string]chan *pb.ChatMessage),
-		authEnabled:   authEnabled,
+		chatServer:          server,
+		activeStreams:       make(map[string]*middlewareStream),
+		usedAuthentications: make(map[[32]byte]int64),
+		authEnabled:         authEnabled,
 	}
 	if authEnabled {
 		key, err := loadClientPublicKey("ai_grpc_client.pub")
@@ -98,6 +117,22 @@ func (s *gRPCServer) authenticate(message *pb.AIResponse, clientIP string) error
 	if err := verifySignature(s.clientPubKey, message.Ip, message.AuthTimestamp, message.AuthSignature); err != nil {
 		return status.Error(codes.Unauthenticated, err.Error())
 	}
+	digest := authenticationDigest(message.Ip, message.AuthTimestamp)
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	now := time.Now().UnixMilli()
+	for token, expires := range s.usedAuthentications {
+		if expires < now {
+			delete(s.usedAuthentications, token)
+		}
+	}
+	if _, exists := s.usedAuthentications[digest]; exists {
+		return status.Error(codes.Unauthenticated, "authentication has already been used")
+	}
+	if len(s.usedAuthentications) >= 4096 {
+		return status.Error(codes.ResourceExhausted, "authentication window is full")
+	}
+	s.usedAuthentications[digest] = message.AuthTimestamp + 60_000
 	return nil
 }
 
@@ -112,6 +147,7 @@ func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) err
 	if host, _, err := net.SplitHostPort(clientIP); err == nil {
 		clientIP = host
 	}
+	replies := make(map[string]replyState)
 	if s.authEnabled {
 		message, err := stream.Recv()
 		if err != nil {
@@ -120,14 +156,14 @@ func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) err
 		if err := s.authenticate(message, clientIP); err != nil {
 			return err
 		}
-		if err := s.handleResponse(message); err != nil {
+		if err := s.handleResponse(message, replies); err != nil {
 			return err
 		}
 	}
 	id := cryptorand.Text()
-	messages := make(chan *pb.ChatMessage, 100)
+	subscription := &middlewareStream{messages: make(chan *pb.ChatMessage, 100), overflow: make(chan struct{})}
 	s.activeStreamMu.Lock()
-	s.activeStreams[id] = messages
+	s.activeStreams[id] = subscription
 	s.activeStreamMu.Unlock()
 	defer func() {
 		s.activeStreamMu.Lock()
@@ -147,7 +183,7 @@ func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) err
 				received <- err
 				return
 			}
-			if err := s.handleResponse(message); err != nil {
+			if err := s.handleResponse(message, replies); err != nil {
 				received <- err
 				return
 			}
@@ -155,47 +191,92 @@ func (s *gRPCServer) StreamChat(stream pb.StreamMiddleware_StreamChatServer) err
 	}()
 	for {
 		select {
-		case message := <-messages:
+		case <-subscription.overflow:
+			return status.Error(codes.ResourceExhausted, "middleware feed exceeded its queue; reconnect")
+		case message := <-subscription.messages:
 			if err := stream.Send(message); err != nil {
 				return err
 			}
 		case err := <-received:
-			return err
+			if err != nil {
+				return err
+			}
+			// A client may stop sending replies while it continues receiving chat.
+			received = nil
 		case <-stream.Context().Done():
 			return stream.Context().Err()
 		}
 	}
 }
 
-func (s *gRPCServer) handleResponse(message *pb.AIResponse) error {
-	if message.MessageId == "" || message.Text == "" {
+// Each RPC owns its reply map. Prompt IDs select replies within that RPC;
+// generated storage IDs keep prompts and independent assistants distinct.
+func (s *gRPCServer) handleResponse(message *pb.AIResponse, replies map[string]replyState) error {
+	if message.MessageId == "" {
 		return nil
 	}
-	updated, err := s.chatServer.UpdateMessage(message.MessageId, message.Text)
-	if err != nil {
-		return err
-	}
-	if updated {
+	reply, exists := replies[message.MessageId]
+	if message.Text == "" {
+		if message.IsFinal {
+			delete(replies, message.MessageId)
+		}
 		return nil
 	}
-	nick := sanitizeNickname(message.Nick)
-	if nick == "" {
-		nick = "AI"
+	if !exists && len(replies) >= 100 {
+		return status.Error(codes.ResourceExhausted, "too many unfinished replies")
 	}
-	_, err = s.chatServer.AppendMessageWithID(chat.Message{
-		ID:    message.MessageId,
-		Time:  time.Now(),
-		Nick:  nick,
-		Text:  message.Text,
-		Color: 31 + rand.Intn(6),
-	})
-	return err
+	chunk := sanitizeReplyText(message.Text)
+	if len(reply.text)+len(chunk) > 64*1024 {
+		return status.Error(codes.ResourceExhausted, "reply exceeds 64 KiB")
+	}
+	text := reply.text + chunk
+	if exists {
+		updated, err := s.chatServer.UpdateMessage(reply.id, text)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			return status.Error(codes.NotFound, "reply is no longer in chat history")
+		}
+	} else {
+		nick := sanitizeNickname(message.Nick)
+		if nick == "" {
+			nick = "AI"
+		}
+		stored, err := s.chatServer.AppendMessageWithID(chat.Message{
+			Time: time.Now(), Nick: nick, Text: text, Color: 31 + rand.Intn(6),
+		})
+		if err != nil {
+			return err
+		}
+		reply.id = stored.ID
+	}
+	reply.text = text
+	if message.IsFinal {
+		delete(replies, message.MessageId)
+	} else {
+		replies[message.MessageId] = reply
+	}
+	return nil
+}
+
+func sanitizeReplyText(raw string) string {
+	var text strings.Builder
+	text.Grow(len(raw))
+	for _, r := range raw {
+		switch r {
+		case '\r', '\n', '\t':
+			text.WriteByte(' ')
+		default:
+			if unicode.IsPrint(r) {
+				text.WriteRune(r)
+			}
+		}
+	}
+	return text.String()
 }
 
 func (s *gRPCServer) BroadcastMessage(message chat.Message) {
-	if message.Nick == "AI" || message.Nick == "server" {
-		return
-	}
 	out := &pb.ChatMessage{
 		MessageId: message.ID,
 		Nick:      message.Nick,
@@ -205,15 +286,20 @@ func (s *gRPCServer) BroadcastMessage(message chat.Message) {
 	}
 	s.activeStreamMu.Lock()
 	defer s.activeStreamMu.Unlock()
-	for _, stream := range s.activeStreams {
+	for id, stream := range s.activeStreams {
 		select {
-		case stream <- out:
+		case stream.messages <- out:
 		default:
+			close(stream.overflow)
+			delete(s.activeStreams, id)
 		}
 	}
 }
 
 func startGRPCServer(server *chat.ChatServer, securityMode string, authEnabled bool, hostKeyPath string) (*grpc.Server, *gRPCServer, error) {
+	if authEnabled && securityMode == "none" {
+		return nil, nil, errors.New("signed middleware authentication requires TLS")
+	}
 	service, err := newGRPCServer(server, authEnabled)
 	if err != nil {
 		return nil, nil, err

@@ -98,13 +98,15 @@ func (x *ChatMessage) GetIp() string {
 	return ""
 }
 
-// AIResponse represents AI's response chunk(s)
+// AIResponse carries incremental reply text. Each stream owns one in-progress
+// reply per referenced prompt. is_final ends that reply. A half-closed send side
+// continues receiving ChatMessage events. Queue overflow ends the RPC explicitly.
 type AIResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MessageId     string                 `protobuf:"bytes,1,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"`              // References the ChatMessage ID being responded to
-	Text          string                 `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`                                         // Text chunk (can be partial for streaming)
+	Text          string                 `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`                                         // Next text fragment, appended to the reply
 	IsFinal       bool                   `protobuf:"varint,3,opt,name=is_final,json=isFinal,proto3" json:"is_final,omitempty"`                   // True if this is the last chunk for this message_id
-	AuthSignature []byte                 `protobuf:"bytes,4,opt,name=auth_signature,json=authSignature,proto3" json:"auth_signature,omitempty"`  // ECDSA signature for client authentication (sent only in first message)
+	AuthSignature []byte                 `protobuf:"bytes,4,opt,name=auth_signature,json=authSignature,proto3" json:"auth_signature,omitempty"`  // One-use ECDSA authentication signature (first message; TLS required)
 	AuthTimestamp int64                  `protobuf:"varint,5,opt,name=auth_timestamp,json=authTimestamp,proto3" json:"auth_timestamp,omitempty"` // Unix timestamp in milliseconds (signed with signature)
 	Nick          string                 `protobuf:"bytes,6,opt,name=nick,proto3" json:"nick,omitempty"`                                         // Nickname for the AI sender
 	Ip            string                 `protobuf:"bytes,7,opt,name=ip,proto3" json:"ip,omitempty"`                                             // IPv4 address of the client (signed with signature)

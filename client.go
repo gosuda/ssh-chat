@@ -23,6 +23,7 @@ import (
 var (
 	grpcSecurityMode  string
 	grpcPort          string
+	grpcHost          string
 	grpcAuthEnabled   bool
 	sshPort           string
 	addr              string
@@ -49,6 +50,7 @@ func newRootCommand() *cobra.Command {
 	rootCmd.Flags().Bool("sqlite", false, "enable SQLite message store")
 	rootCmd.Flags().StringVar(&sshPort, "ssh-port", "2222", "SSH port (alternative to --addr)")
 	rootCmd.Flags().StringVar(&grpcPort, "grpc-port", "3333", "gRPC middleware port")
+	rootCmd.Flags().StringVar(&grpcHost, "grpc-host", "127.0.0.1", "gRPC bind IP; remote access requires authenticated TLS")
 	rootCmd.Flags().StringVar(&grpcSecurityMode, "grpc-security", "none", "gRPC security mode: none, tls, mtls")
 	rootCmd.Flags().BoolVar(&grpcAuthEnabled, "grpc-auth", false, "require ECDSA authentication using ai_grpc_client.pub")
 	rootCmd.MarkFlagsMutuallyExclusive("addr", "ssh-port")
@@ -63,6 +65,23 @@ func main() {
 	}
 }
 
+func middlewareAddress(host, port, security string, auth bool) (string, error) {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", errors.New("gRPC host must be a literal IP address")
+	}
+	if security != "none" && security != "tls" && security != "mtls" {
+		return "", fmt.Errorf("invalid gRPC security mode %q", security)
+	}
+	if auth && security == "none" {
+		return "", errors.New("signed middleware authentication requires TLS")
+	}
+	if !ip.IsLoopback() && security != "mtls" && !(security == "tls" && auth) {
+		return "", errors.New("remote middleware access requires mTLS or TLS with signed authentication")
+	}
+	return net.JoinHostPort(ip.String(), port), nil
+}
+
 func runServe(cmd *cobra.Command, args []string) error {
 	quitCh := make(chan os.Signal, 1)
 	signal.Notify(quitCh, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
@@ -70,6 +89,22 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if cmd.Flags().Changed("ssh-port") {
 		addr = net.JoinHostPort("", sshPort)
 	}
+
+	grpcAddress, err := middlewareAddress(grpcHost, grpcPort, grpcSecurityMode, grpcAuthEnabled)
+	if err != nil {
+		return err
+	}
+	// Acquire both listeners before opening the store or recording any messages.
+	sshListener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for SSH: %w", err)
+	}
+	defer sshListener.Close()
+	listener, err := net.Listen("tcp", grpcAddress)
+	if err != nil {
+		return fmt.Errorf("listen for gRPC middleware: %w", err)
+	}
+	defer listener.Close()
 
 	var store chat.MessageStore
 	useSqlite, _ := cmd.Flags().GetBool("sqlite")
@@ -92,11 +127,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	grpcServer, middleware, err := startGRPCServer(globalChat, grpcSecurityMode, grpcAuthEnabled, hostKeyPath)
 	if err != nil {
 		return fmt.Errorf("initialize gRPC middleware: %w", err)
-	}
-	listener, err := net.Listen("tcp", net.JoinHostPort("", grpcPort))
-	if err != nil {
-		grpcServer.Stop()
-		return fmt.Errorf("listen for gRPC middleware: %w", err)
 	}
 	defer stopGRPCServer(grpcServer)
 	globalChat.SetUserMessageHandler(middleware.BroadcastMessage)
@@ -167,12 +197,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		client.Wait()
 	}
 
-	return startAndMonitorServer(addr, hostKeyPath, h, globalChat, shutdownCountdown, quitCh, grpcErrors)
+	return startAndMonitorServer(sshListener, hostKeyPath, h, globalChat, shutdownCountdown, quitCh, grpcErrors)
 }
 
 // startAndMonitorServer는 SSH 서버를 시작하고 비정상 종료 시 재시작 로직을 처리합니다.
 func startAndMonitorServer(
-	addr string,
+	listener net.Listener,
 	hostKeyPath string,
 	h ssh.Handler,
 	globalChat *chat.ChatServer,
@@ -180,6 +210,8 @@ func startAndMonitorServer(
 	quitCh chan os.Signal,
 	grpcErrors <-chan error,
 ) error {
+	addr := listener.Addr().String()
+	defer func() { _ = listener.Close() }()
 	// 서버 자동 재시작 루프
 	for {
 		// 서버 생성
@@ -203,7 +235,7 @@ func startAndMonitorServer(
 				}
 			}()
 			log.Printf("starting ssh chat server on %s ...", addr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
+			if err := srv.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
 				errCh <- err
 			}
 		}()
@@ -218,6 +250,12 @@ func startAndMonitorServer(
 			_ = srv.Close() // 새 연결 막고 종료
 			return nil
 		case err := <-errCh:
+			_ = srv.Close()
+			restarted, listenErr := net.Listen("tcp", addr)
+			if listenErr != nil {
+				return fmt.Errorf("restart SSH listener after %v: %w", err, listenErr)
+			}
+			listener = restarted
 			log.Printf("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥: %v", err)            // 서버 죽음 알림
 			globalChat.AppendSystemMessage("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥") // 클라이언트에게도 알림
 			_ = srv.Close()                                        // 현재 서버 인스턴스 종료

@@ -30,7 +30,7 @@ const (
 type StreamMiddlewareClient interface {
 	// StreamChat establishes a bidirectional stream:
 	// - Server sends ChatMessage when SSH clients send messages
-	// - Client sends AIResponse with streaming text chunks
+	// - Client sends AIResponse with incremental streaming text chunks
 	StreamChat(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[AIResponse, ChatMessage], error)
 }
 
@@ -63,7 +63,7 @@ type StreamMiddleware_StreamChatClient = grpc.BidiStreamingClient[AIResponse, Ch
 type StreamMiddlewareServer interface {
 	// StreamChat establishes a bidirectional stream:
 	// - Server sends ChatMessage when SSH clients send messages
-	// - Client sends AIResponse with streaming text chunks
+	// - Client sends AIResponse with incremental streaming text chunks
 	StreamChat(grpc.BidiStreamingServer[AIResponse, ChatMessage]) error
 	mustEmbedUnimplementedStreamMiddlewareServer()
 }

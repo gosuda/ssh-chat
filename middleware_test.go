@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,28 +121,48 @@ func TestBidirectionalMessagesSurviveTheStorageRefactor(t *testing.T) {
 			if first.MessageId == "" || first.Nick != "reader" || first.Text != "question" || first.Ip != "192.0.2.1" {
 				t.Fatalf("incorrect outbound message: %v", first)
 			}
-			if err := stream.Send(&pb.AIResponse{MessageId: "response", Nick: "Assistant", Text: "part"}); err != nil {
+			if err := stream.Send(&pb.AIResponse{MessageId: first.MessageId, Nick: "Assistant", Text: "part\x1b"}); err != nil {
 				t.Fatal(err)
 			}
+			replyID := ""
 			await(t, func() bool {
 				for _, m := range core.Messages() {
-					if m.ID == "response" && m.Text == "part" {
+					if m.ID != first.MessageId && m.Nick == "Assistant" && m.Text == "part" {
+						replyID = m.ID
 						return true
 					}
 				}
 				return false
 			})
-			if err := stream.Send(&pb.AIResponse{MessageId: "response", Text: " \ncomplete\nanswer"}); err != nil {
+			if err := stream.Send(&pb.AIResponse{MessageId: first.MessageId, Text: " complete\nanswer\u009b", IsFinal: true}); err != nil {
 				t.Fatal(err)
 			}
 			await(t, func() bool {
 				for _, m := range core.Messages() {
-					if m.ID == "response" && m.Text == "complete answer" {
+					if m.ID == replyID && m.Text == "part complete answer" {
 						return true
 					}
 				}
 				return false
 			})
+			prompts, replies := 0, 0
+			for _, message := range core.Messages() {
+				if message.ID == first.MessageId {
+					prompts++
+					if message.Nick != "reader" || message.Text != "question" {
+						t.Fatalf("prompt was overwritten: %+v", message)
+					}
+				}
+				if message.Nick == "Assistant" {
+					replies++
+					if message.ID != replyID || message.Text != "part complete answer" {
+						t.Fatalf("reply identity or incremental text changed: %+v", message)
+					}
+				}
+			}
+			if prompts != 1 || replies != 1 {
+				t.Fatalf("prompt and reply must coexist exactly once: prompts=%d replies=%d", prompts, replies)
+			}
 			core.AppendSystemMessage("administration")
 			core.AppendUserMessage(chat.Message{Time: time.Now(), Nick: "reader", Text: "next", Color: 32})
 			next, err := stream.Recv()
@@ -149,6 +171,39 @@ func TestBidirectionalMessagesSurviveTheStorageRefactor(t *testing.T) {
 			}
 			if next.Text != "next" || next.MessageId == first.MessageId {
 				t.Fatalf("response loop or unstable ID: %v", next)
+			}
+			for _, nickname := range []string{"AI", "server"} {
+				core.AppendUserMessage(chat.Message{Time: time.Now(), Nick: nickname, Text: "human", Color: 32})
+				delivered, err := stream.Recv()
+				if err != nil || delivered.GetNick() != nickname {
+					t.Fatalf("user nickname was filtered: %q %v %v", nickname, delivered, err)
+				}
+			}
+			if err := stream.CloseSend(); err != nil {
+				t.Fatal(err)
+			}
+			type delivery struct {
+				message *pb.ChatMessage
+				err     error
+			}
+			pending := make(chan delivery, 1)
+			go func() {
+				message, err := stream.Recv()
+				pending <- delivery{message: message, err: err}
+			}()
+			select {
+			case early := <-pending:
+				t.Fatalf("half-close ended the receive feed: %v", early.err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			core.AppendUserMessage(chat.Message{Time: time.Now(), Nick: "reader", Text: "after half-close", Color: 32})
+			select {
+			case delivered := <-pending:
+				if delivered.err != nil || delivered.message.GetText() != "after half-close" {
+					t.Fatalf("half-closed feed did not receive chat: %+v", delivered)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("half-closed feed timed out")
 			}
 			cancel()
 			await(t, func() bool { return streamCount(service) == 0 })
@@ -183,7 +238,7 @@ func TestAuthenticationPrecedesBroadcastRegistration(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	service := &gRPCServer{chatServer: core, activeStreams: make(map[string]chan *pb.ChatMessage), clientPubKey: &key.PublicKey, authEnabled: true}
+	service := &gRPCServer{chatServer: core, activeStreams: make(map[string]*middlewareStream), usedAuthentications: make(map[[32]byte]int64), clientPubKey: &key.PublicKey, authEnabled: true}
 	server := grpc.NewServer()
 	pb.RegisterStreamMiddlewareServer(server, service)
 	client := startTestRPC(t, server, service, insecure.NewCredentials())
@@ -207,10 +262,24 @@ func TestAuthenticationPrecedesBroadcastRegistration(t *testing.T) {
 		t.Fatal(err)
 	}
 	timestamp := time.Now().UnixMilli()
-	if err := valid.Send(&pb.AIResponse{Ip: "127.0.0.1", AuthTimestamp: timestamp, AuthSignature: signAuthentication(t, key, "127.0.0.1", timestamp)}); err != nil {
+	signature := signAuthentication(t, key, "127.0.0.1", timestamp)
+	if err := valid.Send(&pb.AIResponse{Ip: "127.0.0.1", AuthTimestamp: timestamp, AuthSignature: signature}); err != nil {
 		t.Fatal(err)
 	}
 	await(t, func() bool { return streamCount(service) == 1 })
+	duplicate, err := client.StreamChat(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := duplicate.Send(&pb.AIResponse{Ip: "127.0.0.1", AuthTimestamp: timestamp, AuthSignature: signature}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := duplicate.Recv(); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("replayed authentication accepted: %v", err)
+	}
+	if streamCount(service) != 1 {
+		t.Fatal("replayed stream entered broadcast map")
+	}
 	service.BroadcastMessage(chat.Message{ID: "authenticated", Time: time.Now(), Nick: "reader", Text: "visible"})
 	got, err := valid.Recv()
 	if err != nil || got.GetMessageId() != "authenticated" {
@@ -298,15 +367,169 @@ func TestTLSModesAndCustomHostKey(t *testing.T) {
 
 func TestCLIContainsBothSetsOfOptions(t *testing.T) {
 	command := newRootCommand()
-	for _, flag := range []string{"addr", "host-key", "max-per-ip", "shutdown-countdown", "db-path", "sqlite", "ssh-port", "grpc-port", "grpc-security", "grpc-auth"} {
+	for _, flag := range []string{"addr", "host-key", "max-per-ip", "shutdown-countdown", "db-path", "sqlite", "ssh-port", "grpc-port", "grpc-host", "grpc-security", "grpc-auth"} {
 		if command.Flags().Lookup(flag) == nil {
 			t.Fatalf("lost option --%s", flag)
 		}
 	}
-	if grpcPort != "3333" || sshPort != "2222" || grpcSecurityMode != "none" || grpcAuthEnabled {
+	if grpcPort != "3333" || grpcHost != "127.0.0.1" || sshPort != "2222" || grpcSecurityMode != "none" || grpcAuthEnabled {
 		t.Fatal("middleware defaults changed")
 	}
 	if got := sanitizeNickname("\x1breader\n"); got != "reader" {
 		t.Fatalf("nickname sanitizer lost: %q", got)
+	}
+}
+
+func TestListenerCollisionDoesNotTouchHistory(t *testing.T) {
+	for _, flag := range []string{"addr", "ssh-port"} {
+		t.Run(flag, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "history.db")
+			store, err := chat.NewSQLiteMessageStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Init(); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AppendMessage(chat.Message{ID: "retained", Time: time.Now(), Nick: "reader", Text: "history", Color: 32}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reservation, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			address := reservation.Addr().String()
+			_, port, err := net.SplitHostPort(address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := reservation.Close(); err != nil {
+				t.Fatal(err)
+			}
+			command := newRootCommand()
+			value := address
+			if flag == "ssh-port" {
+				value = port
+			}
+			command.SetArgs([]string{"--" + flag, value, "--grpc-port", port, "--sqlite", "--db-path", path})
+			if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "listen for gRPC middleware") {
+				t.Fatalf("listener collision did not fail before server startup: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("listener collision changed chat history")
+			}
+			released, err := net.Listen("tcp", address)
+			if err != nil {
+				t.Fatalf("failed startup leaked SSH listener: %v", err)
+			}
+			if err := released.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRemoteMiddlewareRequiresAuthenticatedTransport(t *testing.T) {
+	for _, host := range []string{"0.0.0.0", "::", "192.0.2.1"} {
+		for _, mode := range []string{"none", "tls"} {
+			if _, err := middlewareAddress(host, "3333", mode, false); err == nil {
+				t.Fatalf("unauthenticated remote middleware allowed: %s %s", host, mode)
+			}
+		}
+		if _, err := middlewareAddress(host, "3333", "mtls", false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := middlewareAddress(host, "3333", "tls", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if address, err := middlewareAddress("127.0.0.1", "3333", "none", false); err != nil || address != "127.0.0.1:3333" {
+		t.Fatalf("loopback default failed: %q %v", address, err)
+	}
+	if _, err := middlewareAddress("127.0.0.1", "3333", "none", true); err == nil {
+		t.Fatal("signed authentication allowed without TLS")
+	}
+}
+
+func TestBroadcastOverflowClosesTheSubscriber(t *testing.T) {
+	subscription := &middlewareStream{messages: make(chan *pb.ChatMessage, 1), overflow: make(chan struct{})}
+	service := &gRPCServer{activeStreams: map[string]*middlewareStream{"slow": subscription}}
+	service.BroadcastMessage(chat.Message{ID: "first", Nick: "reader", Text: "first"})
+	service.BroadcastMessage(chat.Message{ID: "second", Nick: "reader", Text: "second"})
+	select {
+	case <-subscription.overflow:
+	default:
+		t.Fatal("queue overflow silently discarded a message")
+	}
+	if streamCount(service) != 0 {
+		t.Fatal("overflowed subscriber remained registered")
+	}
+	if first := <-subscription.messages; first.GetMessageId() != "first" {
+		t.Fatalf("queue overwrote an earlier message: %v", first)
+	}
+}
+
+func TestPromptIDsNeverBecomeReplyStorageIDs(t *testing.T) {
+	for _, kind := range []string{"memory", "sqlite"} {
+		t.Run(kind, func(t *testing.T) {
+			var store chat.MessageStore = chat.NewMemoryMessageStore()
+			if kind == "sqlite" {
+				var err error
+				store, err = chat.NewSQLiteMessageStore(filepath.Join(t.TempDir(), "chat.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			core, err := chat.NewChatServer(store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := core.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			prompt, err := core.AppendMessageWithID(chat.Message{ID: "prompt", Time: time.Now(), Nick: "reader", Text: "question", Color: 32})
+			if err != nil {
+				t.Fatal(err)
+			}
+			service := &gRPCServer{chatServer: core}
+			replies := make(map[string]replyState)
+			if err := service.handleResponse(&pb.AIResponse{MessageId: prompt.ID, Nick: "Assistant", Text: "first"}, replies); err != nil {
+				t.Fatalf("reply must have a separate storage ID: %v", err)
+			}
+			if err := service.handleResponse(&pb.AIResponse{MessageId: prompt.ID, Text: " second", IsFinal: true}, replies); err != nil {
+				t.Fatal(err)
+			}
+			prompts, responses := 0, 0
+			for _, message := range core.Messages() {
+				if message.ID == prompt.ID {
+					prompts++
+					if message.Text != "question" || message.Nick != "reader" {
+						t.Fatalf("prompt was overwritten: %+v", message)
+					}
+				}
+				if message.Nick == "Assistant" {
+					responses++
+					if message.ID == prompt.ID || message.Text != "first second" {
+						t.Fatalf("reply must have a separate storage ID and append chunks: %+v", message)
+					}
+				}
+			}
+			if prompts != 1 || responses != 1 || len(replies) != 0 {
+				t.Fatalf("reply lifecycle lost prompt or duplicated response: %d %d %d", prompts, responses, len(replies))
+			}
+		})
 	}
 }
