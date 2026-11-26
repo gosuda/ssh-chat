@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/gliderlabs/ssh"
 	"github.com/iwanhae/ssh-chat/chat"
@@ -20,6 +21,11 @@ import (
 )
 
 var (
+	grpcSecurityMode  string
+	grpcPort          string
+	grpcHost          string
+	grpcAuthEnabled   bool
+	sshPort           string
 	addr              string
 	hostKeyPath       string
 	maxPerIP          int
@@ -28,7 +34,7 @@ var (
 	dbPath            string // SQLite 데이터베이스 파일 경로
 )
 
-func main() {
+func newRootCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "ssh-chat",
 		Short: "A tiny SSH chat server",
@@ -42,15 +48,63 @@ func main() {
 	rootCmd.Flags().DurationVar(&shutdownCountdown, "shutdown-countdown", 5*time.Second, "graceful shutdown countdown duration")
 	rootCmd.Flags().StringVar(&dbPath, "db-path", "chat.db", "path to SQLite database file") // dbPath 플래그 추가
 	rootCmd.Flags().Bool("sqlite", false, "enable SQLite message store")
+	rootCmd.Flags().StringVar(&sshPort, "ssh-port", "2222", "SSH port (alternative to --addr)")
+	rootCmd.Flags().StringVar(&grpcPort, "grpc-port", "3333", "gRPC middleware port")
+	rootCmd.Flags().StringVar(&grpcHost, "grpc-host", "127.0.0.1", "gRPC bind IP; remote access requires authenticated TLS")
+	rootCmd.Flags().StringVar(&grpcSecurityMode, "grpc-security", "none", "gRPC security mode: none, tls, mtls")
+	rootCmd.Flags().BoolVar(&grpcAuthEnabled, "grpc-auth", false, "require ECDSA authentication using ai_grpc_client.pub")
+	rootCmd.MarkFlagsMutuallyExclusive("addr", "ssh-port")
+	return rootCmd
+}
+
+func main() {
+	rootCmd := newRootCommand()
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
+func middlewareAddress(host, port, security string, auth bool) (string, error) {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", errors.New("gRPC host must be a literal IP address")
+	}
+	if security != "none" && security != "tls" && security != "mtls" {
+		return "", fmt.Errorf("invalid gRPC security mode %q", security)
+	}
+	if auth && security == "none" {
+		return "", errors.New("signed middleware authentication requires TLS")
+	}
+	if !ip.IsLoopback() && security != "mtls" && !(security == "tls" && auth) {
+		return "", errors.New("remote middleware access requires mTLS or TLS with signed authentication")
+	}
+	return net.JoinHostPort(ip.String(), port), nil
+}
+
 func runServe(cmd *cobra.Command, args []string) error {
 	quitCh := make(chan os.Signal, 1)
 	signal.Notify(quitCh, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(quitCh)
+	if cmd.Flags().Changed("ssh-port") {
+		addr = net.JoinHostPort("", sshPort)
+	}
+
+	grpcAddress, err := middlewareAddress(grpcHost, grpcPort, grpcSecurityMode, grpcAuthEnabled)
+	if err != nil {
+		return err
+	}
+	// Acquire both listeners before opening the store or recording any messages.
+	sshListener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for SSH: %w", err)
+	}
+	defer sshListener.Close()
+	listener, err := net.Listen("tcp", grpcAddress)
+	if err != nil {
+		return fmt.Errorf("listen for gRPC middleware: %w", err)
+	}
+	defer listener.Close()
 
 	var store chat.MessageStore
 	useSqlite, _ := cmd.Flags().GetBool("sqlite")
@@ -69,6 +123,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("채팅 서버 초기화 실패: %w", err)
 	}
 	defer globalChat.Close() // 서버 종료 시 데이터베이스 연결 닫기
+
+	grpcServer, middleware, err := startGRPCServer(globalChat, grpcSecurityMode, grpcAuthEnabled, hostKeyPath)
+	if err != nil {
+		return fmt.Errorf("initialize gRPC middleware: %w", err)
+	}
+	defer stopGRPCServer(grpcServer)
+	globalChat.SetUserMessageHandler(middleware.BroadcastMessage)
+	grpcErrors := make(chan error, 1)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil {
+			grpcErrors <- err
+		}
+	}()
 
 	// SSH 세션 핸들러
 	h := func(s ssh.Session) {
@@ -99,7 +166,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return
 		}
 
-		nickname := strings.TrimSpace(s.User())
+		nickname := sanitizeNickname(s.User())
 		if nickname == "" {
 			nickname = generateGuestNickname()
 		}
@@ -130,18 +197,21 @@ func runServe(cmd *cobra.Command, args []string) error {
 		client.Wait()
 	}
 
-	return startAndMonitorServer(addr, hostKeyPath, h, globalChat, shutdownCountdown, quitCh)
+	return startAndMonitorServer(sshListener, hostKeyPath, h, globalChat, shutdownCountdown, quitCh, grpcErrors)
 }
 
 // startAndMonitorServer는 SSH 서버를 시작하고 비정상 종료 시 재시작 로직을 처리합니다.
 func startAndMonitorServer(
-	addr string,
+	listener net.Listener,
 	hostKeyPath string,
 	h ssh.Handler,
 	globalChat *chat.ChatServer,
 	shutdownCountdown time.Duration,
 	quitCh chan os.Signal,
+	grpcErrors <-chan error,
 ) error {
+	addr := listener.Addr().String()
+	defer func() { _ = listener.Close() }()
 	// 서버 자동 재시작 루프
 	for {
 		// 서버 생성
@@ -165,18 +235,27 @@ func startAndMonitorServer(
 				}
 			}()
 			log.Printf("starting ssh chat server on %s ...", addr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
+			if err := srv.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
 				errCh <- err
 			}
 		}()
 
 		select {
+		case err := <-grpcErrors:
+			_ = srv.Close()
+			return fmt.Errorf("serve gRPC middleware: %w", err)
 		case sig := <-quitCh:
 			log.Printf("received signal: %v", sig)
 			runShutdownSequence(globalChat, shutdownCountdown)
 			_ = srv.Close() // 새 연결 막고 종료
 			return nil
 		case err := <-errCh:
+			_ = srv.Close()
+			restarted, listenErr := net.Listen("tcp", addr)
+			if listenErr != nil {
+				return fmt.Errorf("restart SSH listener after %v: %w", err, listenErr)
+			}
+			listener = restarted
 			log.Printf("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥: %v", err)            // 서버 죽음 알림
 			globalChat.AppendSystemMessage("💥💥💥💥💥💥또죽었어요. 아파요💥💥💥💥") // 클라이언트에게도 알림
 			_ = srv.Close()                                        // 현재 서버 인스턴스 종료
@@ -212,4 +291,24 @@ func runShutdownSequence(globalChat *chat.ChatServer, countdown time.Duration) {
 func generateGuestNickname() string {
 	id := atomic.AddUint64(&guestCounter, 1)
 	return fmt.Sprintf("guest-%d", id)
+}
+
+func sanitizeNickname(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+
+	for _, r := range raw {
+		if r == '\x1b' || r == '\x9b' {
+			continue
+		}
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+
+	return strings.TrimSpace(b.String())
 }

@@ -8,7 +8,7 @@ option go_package = "github.com/iwanhae/ssh-chat/proto;proto";
 service StreamMiddleware {
   // StreamChat establishes a bidirectional stream:
   // - Server sends ChatMessage when SSH clients send messages
-  // - Client sends AIResponse with streaming text chunks
+  // - Client sends AIResponse snapshots or explicitly selected delta chunks
   rpc StreamChat(stream AIResponse) returns (stream ChatMessage) {}
 }
 
@@ -21,13 +21,24 @@ message ChatMessage {
   string ip = 5;          // IP address of the sender
 }
 
-// AIResponse represents AI's response chunk(s)
+// ResponseFormat defines how text changes the current reply.
+// SNAPSHOT is the legacy default; clients opt in to incremental DELTA messages.
+enum ResponseFormat {
+  SNAPSHOT = 0;
+  DELTA = 1;
+}
+
+// AIResponse carries a snapshot by default, preserving existing clients.
+// Each stream owns one in-progress reply per referenced prompt. is_final ends
+// that reply. A half-closed send side continues receiving ChatMessage events.
+// Queue overflow ends the RPC explicitly.
 message AIResponse {
   string message_id = 1;  // References the ChatMessage ID being responded to
-  string text = 2;        // Text chunk (can be partial for streaming)
+  string text = 2;        // Full reply snapshot, or next fragment when format is DELTA
   bool is_final = 3;      // True if this is the last chunk for this message_id
-  bytes auth_signature = 4;  // ECDSA signature for client authentication (sent only in first message)
+  bytes auth_signature = 4;  // One-use ECDSA authentication signature (first message; TLS required)
   int64 auth_timestamp = 5;  // Unix timestamp in milliseconds (signed with signature)
   string nick = 6;        // Nickname for the AI sender
   string ip = 7;          // IPv4 address of the client (signed with signature)
+  ResponseFormat format = 8; // Applies to this message; absent means SNAPSHOT
 }

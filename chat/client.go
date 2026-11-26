@@ -49,7 +49,7 @@ func NewClient(server *ChatServer, banManager *BanManager, store MessageStore, s
 	userColor, err := store.GetUserColor(nickname)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			userColor = 37 
+			userColor = 37
 			if err := store.CreateUser(nickname, userColor); err != nil {
 				log.Printf("Failed to create new user %s in DB: %v", nickname, err)
 			}
@@ -178,7 +178,7 @@ func (c *Client) render() {
 		log.Printf("Failed to get message count: %v", err)
 		totalMessages = 0 // fallback
 	}
-    // [OPTIMIZATION]
+	// [OPTIMIZATION]
 	// 스크롤 오프셋에 맞게 100개의 메시지로 제한합니다.
 	fetchLimit := 100
 	// 휴리스틱: 넉넉잡아 메시지 1개를 1.5줄로 합니다.
@@ -434,7 +434,7 @@ func (c *Client) handleEnter() {
 		return
 	}
 
-	c.server.AppendMessage(Message{
+	c.server.AppendUserMessage(Message{
 		Time:  getTimeInSeoul(),
 		Nick:  c.nickname,
 		Text:  text,
@@ -592,8 +592,8 @@ func formatMessage(msg Message, width int) []string {
 	// Highlight mentions in the message text
 	highlightedText := highlightMentions(msg.Text, msg.Mentions)
 
-  prefix := fmt.Sprintf("[%s] %s: ", msg.Time.Format("15:04:05"), coloredNick)
-  indent := strings.Repeat(" ", len(msg.Nick)+13)
+	prefix := fmt.Sprintf("[%s] %s: ", msg.Time.Format("15:04:05"), coloredNick)
+	indent := strings.Repeat(" ", len(msg.Nick)+13)
 
 	var lines []string
 	segments := strings.Split(highlightedText, "\n")

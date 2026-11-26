@@ -1,21 +1,24 @@
 package chat
 
 import (
+	cryptorand "crypto/rand"
 	"fmt"
 	"log"
 	"math/rand"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type ChatServer struct {
-	mu        sync.RWMutex
-	Store     MessageStore // 메시지 저장소 인터페이스
-	Bans      *BanManager
-	clients   map[*Client]struct{}
-	ipCounts  map[string]int  // IP당 연결 수 추적
-	nicknames map[string]bool // 사용 중인 닉네임 추적
+	onUserMessage func(Message)
+	mu            sync.RWMutex
+	Store         MessageStore // 메시지 저장소 인터페이스
+	Bans          *BanManager
+	clients       map[*Client]struct{}
+	ipCounts      map[string]int  // IP당 연결 수 추적
+	nicknames     map[string]bool // 사용 중인 닉네임 추적
 }
 
 func NewChatServer(store MessageStore) (*ChatServer, error) {
@@ -38,6 +41,7 @@ func NewChatServer(store MessageStore) (*ChatServer, error) {
 		nicknames: make(map[string]bool),
 	}
 	welcome := Message{
+		ID:    cryptorand.Text(),
 		Time:  getTimeInSeoul(),
 		Nick:  "server",
 		Text:  "Welcome to the SSH chat! Use ↑/↓ to scroll and Enter to send messages.",
@@ -71,12 +75,22 @@ func (cs *ChatServer) RemoveClient(c *Client) {
 }
 
 func (cs *ChatServer) AppendMessage(msg Message) {
+	if _, err := cs.AppendMessageWithID(msg); err != nil {
+		log.Printf("append message: %v", err)
+	}
+}
+
+// AppendMessageWithID stores the message before notifying connected clients.
+func (cs *ChatServer) AppendMessageWithID(msg Message) (Message, error) {
+	if msg.ID == "" {
+		msg.ID = cryptorand.Text()
+	}
 	// 메시지에서 멘션 감지
 	msg.Mentions = extractMentions(msg.Text)
 
 	// 메시지를 데이터베이스에 저장
 	if err := cs.Store.AppendMessage(msg); err != nil {
-		log.Printf("메시지 데이터베이스 저장 실패: %v", err)
+		return Message{}, fmt.Errorf("store message: %w", err)
 	}
 
 	cs.mu.Lock()
@@ -99,6 +113,52 @@ func (cs *ChatServer) AppendMessage(msg Message) {
 		}
 		client.NotifyWithBell(isMentioned)
 	}
+	return msg, nil
+}
+
+// SetUserMessageHandler installs the handler for messages sent by SSH users.
+// System messages and middleware responses do not enter this handler.
+func (cs *ChatServer) SetUserMessageHandler(handler func(Message)) {
+	cs.mu.Lock()
+	cs.onUserMessage = handler
+	cs.mu.Unlock()
+}
+
+func (cs *ChatServer) AppendUserMessage(msg Message) {
+	stored, err := cs.AppendMessageWithID(msg)
+	if err != nil {
+		log.Printf("append user message: %v", err)
+		return
+	}
+	cs.mu.RLock()
+	handler := cs.onUserMessage
+	cs.mu.RUnlock()
+	if handler != nil {
+		handler(stored)
+	}
+}
+
+// UpdateMessage replaces a streamed response in its current store.
+func (cs *ChatServer) UpdateMessage(id, text string) (bool, error) {
+	text = strings.TrimLeftFunc(text, unicode.IsSpace)
+	text = strings.ReplaceAll(strings.ReplaceAll(text, "\r", ""), "\n", " ")
+	updated, err := cs.Store.UpdateMessage(id, text, extractMentions(text))
+	if err != nil {
+		return false, fmt.Errorf("update message %q: %w", id, err)
+	}
+	if !updated {
+		return false, nil
+	}
+	cs.mu.RLock()
+	clients := make([]*Client, 0, len(cs.clients))
+	for client := range cs.clients {
+		clients = append(clients, client)
+	}
+	cs.mu.RUnlock()
+	for _, client := range clients {
+		client.NotifyWithBell(false)
+	}
+	return true, nil
 }
 
 func (cs *ChatServer) AppendSystemMessage(text string) {

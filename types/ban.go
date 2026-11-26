@@ -23,5 +23,3 @@ type Ban struct {
 	Reason   string
 	At       time.Time
 }
-
-

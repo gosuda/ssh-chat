@@ -1,0 +1,5 @@
+*.pub.test
+*.key.test
+
+ssh-chat-server
+ssh-chat

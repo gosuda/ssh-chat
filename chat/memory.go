@@ -1,8 +1,8 @@
 package chat
 
 import (
-	"sync"
 	"github.com/iwanhae/ssh-chat/types"
+	"sync"
 )
 
 // MemoryMessageStore is a simple in-memory message store.
@@ -49,7 +49,7 @@ func (s *MemoryMessageStore) GetMessages(offset, limit int) ([]Message, error) {
 	if start < 0 {
 		start = 0
 	}
-	return s.messages[start:end], nil
+	return append([]Message(nil), s.messages[start:end]...), nil
 }
 
 func (s *MemoryMessageStore) GetMessageCount() (int, error) {
@@ -104,4 +104,18 @@ func (s *MemoryMessageStore) RemoveBan(ban *types.Ban) error {
 	defer s.mu.Unlock()
 	delete(s.bans, ban.IP)
 	return nil
+}
+
+// UpdateMessage replaces one message without changing its position in history.
+func (s *MemoryMessageStore) UpdateMessage(id, text string, mentions []string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := len(s.messages) - 1; index >= 0; index-- {
+		if s.messages[index].ID == id {
+			s.messages[index].Text = text
+			s.messages[index].Mentions = append([]string(nil), mentions...)
+			return true, nil
+		}
+	}
+	return false, nil
 }

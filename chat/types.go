@@ -5,6 +5,7 @@ import (
 )
 
 type Message struct {
+	ID       string
 	Time     time.Time
 	Nick     string
 	Text     string

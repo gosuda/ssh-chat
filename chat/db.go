@@ -15,6 +15,7 @@ import (
 type MessageStore interface {
 	Init() error
 	AppendMessage(msg Message) error
+	UpdateMessage(id, text string, mentions []string) (bool, error)
 	GetMessages(offset, limit int) ([]Message, error)
 	GetMessageCount() (int, error)
 	Close() error
@@ -37,6 +38,7 @@ func NewSQLiteMessageStore(dataSourceName string) (*SQLiteMessageStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("SQLite 데이터베이스 열기 실패: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 	return &SQLiteMessageStore{db: db}, nil
 }
 
@@ -55,6 +57,10 @@ func (s *SQLiteMessageStore) Init() error {
 	_, err := s.db.Exec(createTableSQL)
 	if err != nil {
 		return fmt.Errorf("메시지 테이블 생성 실패: %w", err)
+	}
+
+	if err := s.initMessageIDs(); err != nil {
+		return err
 	}
 
 	createUserTableSQL := `
@@ -100,8 +106,8 @@ func (s *SQLiteMessageStore) AppendMessage(msg Message) error {
 		}
 	}
 
-	insertSQL := `INSERT INTO messages(timestamp, nick, text, color, ip, mentions) VALUES(?, ?, ?, ?, ?, ?)`
-	_, err = tx.Exec(insertSQL, msg.Time, msg.Nick, msg.Text, msg.Color, msg.IP, mentions)
+	insertSQL := `INSERT INTO messages(timestamp, nick, text, color, ip, mentions, message_id) VALUES(?, ?, ?, ?, ?, ?, NULLIF(?, ''))`
+	_, err = tx.Exec(insertSQL, msg.Time, msg.Nick, msg.Text, msg.Color, msg.IP, mentions, msg.ID)
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("메시지 데이터베이스 저장 실패: %w", err)
@@ -130,7 +136,7 @@ func (s *SQLiteMessageStore) AppendMessage(msg Message) error {
 // offset은 최신 메시지부터의 오프셋입니다 (0은 가장 최신).
 // limit은 가져올 메시지의 최대 개수입니다.
 func (s *SQLiteMessageStore) GetMessages(offset, limit int) ([]Message, error) {
-	query := `SELECT timestamp, nick, text, color, ip, mentions FROM messages ORDER BY id DESC LIMIT ? OFFSET ?`
+	query := `SELECT timestamp, nick, text, color, ip, mentions, COALESCE(message_id, '') FROM messages ORDER BY id DESC LIMIT ? OFFSET ?`
 	rows, err := s.db.Query(query, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("메시지 조회 실패: %w", err)
@@ -144,7 +150,7 @@ func (s *SQLiteMessageStore) GetMessages(offset, limit int) ([]Message, error) {
 		var mentionsStr sql.NullString
 		var ipStr sql.NullString
 
-		err := rows.Scan(&timestampStr, &msg.Nick, &msg.Text, &msg.Color, &ipStr, &mentionsStr)
+		err := rows.Scan(&timestampStr, &msg.Nick, &msg.Text, &msg.Color, &ipStr, &mentionsStr, &msg.ID)
 		if err != nil {
 			return nil, fmt.Errorf("메시지 스캔 실패: %w", err)
 		}
@@ -289,4 +295,51 @@ func splitMentions(mentions string) []string {
 		return nil
 	}
 	return strings.Split(mentions, ",")
+}
+
+// initMessageIDs preserves databases created before streamed responses existed.
+func (s *SQLiteMessageStore) initMessageIDs() error {
+	rows, err := s.db.Query("PRAGMA table_info(messages)")
+	if err != nil {
+		return fmt.Errorf("inspect message schema: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var index, required, primary int
+		var name, kind string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&index, &name, &kind, &required, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return fmt.Errorf("read message schema: %w", err)
+		}
+		found = found || name == "message_id"
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("read message schema: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close message schema: %w", err)
+	}
+	if !found {
+		if _, err := s.db.Exec("ALTER TABLE messages ADD COLUMN message_id TEXT"); err != nil {
+			return fmt.Errorf("add message IDs: %w", err)
+		}
+	}
+	if _, err := s.db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS messages_message_id ON messages(message_id) WHERE message_id IS NOT NULL"); err != nil {
+		return fmt.Errorf("index message IDs: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteMessageStore) UpdateMessage(id, text string, mentions []string) (bool, error) {
+	result, err := s.db.Exec("UPDATE messages SET text = ?, mentions = ? WHERE message_id = ?", text, strings.Join(mentions, ","), id)
+	if err != nil {
+		return false, fmt.Errorf("update stored message: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count updated messages: %w", err)
+	}
+	return count != 0, nil
 }

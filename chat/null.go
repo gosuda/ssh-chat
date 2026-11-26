@@ -64,3 +64,8 @@ func (s *NullMessageStore) SaveBan(*types.Ban) error {
 func (s *NullMessageStore) RemoveBan(*types.Ban) error {
 	return nil
 }
+
+// UpdateMessage reports that a discarded message is no longer available.
+func (s *NullMessageStore) UpdateMessage(id, text string, mentions []string) (bool, error) {
+	return false, nil
+}
